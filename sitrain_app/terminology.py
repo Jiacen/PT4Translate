@@ -62,6 +62,11 @@ class TerminologyEngine:
 
 
 _LATIN_WORD = re.compile(r"[A-Za-z][A-Za-z0-9_-]{2,}")
+_SINGLE_DIGIT_CN = {
+    "0": ("零", "〇"), "1": ("一", "壹"), "2": ("二", "两", "贰"),
+    "3": ("三", "叁"), "4": ("四", "肆"), "5": ("五", "伍"),
+    "6": ("六", "陆"), "7": ("七", "柒"), "8": ("八", "捌"), "9": ("九", "玖"),
+}
 
 
 def residual_source_issues(source: str, translated: str) -> list[dict]:
@@ -72,6 +77,12 @@ def residual_source_issues(source: str, translated: str) -> list[dict]:
     if residual and len(residual) >= max(2, len(source_words) // 2):
         issues.append({"code":"SOURCE_RESIDUAL","severity":"warning","message":"译文可能残留较多原文","tokens":residual[:12]})
     for number in re.findall(r"\b\d+(?:[.,]\d+)?\b", source):
+        # Natural Chinese expressions such as “第三级”“两相” retain the
+        # meaning of a single digit.  Keep strict checks for multi-digit values,
+        # decimals, units and model identifiers, where changing the notation is
+        # materially riskier.
+        if len(number) == 1 and any(char in translated for char in _SINGLE_DIGIT_CN[number]):
+            continue
         if number not in translated:
             issues.append({"code":"NUMBER_CHANGED","severity":"blocker","message":f"数字可能丢失：{number}"})
     return issues

@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import zipfile
@@ -22,6 +23,12 @@ from .config import LEGACY_OFFICE
 _ocr_lock = threading.RLock()
 _ocr_engine = None
 _RASTER_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+OFFICE_OCR_MIN_BYTES = 25 * 1024
+OFFICE_OCR_MIN_PIXELS = 80_000
+# Training materials often include screenshots of Siemens applications.  Keep those
+# screenshots intact by default: OCR/replacement makes the UI inaccurate and harms
+# the visual layout.  This is intentionally a server-side policy, not a user task.
+TRANSLATE_OFFICE_IMAGE_TEXT = False
 
 
 def _get_ocr():
@@ -47,7 +54,20 @@ def _ocr_image(content: bytes) -> list[dict]:
 def _office_ocr_units(path: Path, start: int) -> list[dict]:
     units = []
     with zipfile.ZipFile(path) as archive:
-        media = sorted(n for n in archive.namelist() if "/media/" in n and Path(n).suffix.lower() in _RASTER_EXTS)
+        media = []
+        for info in archive.infolist():
+            if "/media/" not in info.filename or Path(info.filename).suffix.lower() not in _RASTER_EXTS:
+                continue
+            if info.file_size >= OFFICE_OCR_MIN_BYTES:
+                media.append(info.filename)
+                continue
+            try:
+                with Image.open(BytesIO(archive.read(info.filename))) as image:
+                    if image.width * image.height >= OFFICE_OCR_MIN_PIXELS:
+                        media.append(info.filename)
+            except Exception:
+                continue
+        media.sort()
         for part in media:
             try:
                 regions = _ocr_image(archive.read(part))
@@ -86,7 +106,7 @@ def preflight(path: Path) -> dict[str, Any]:
               "text_units":0,"images":0,"needs_ocr":False,"legacy":ext in LEGACY_OFFICE,"risks":[]}
     if ext in {".pptx", ".docx", ".xlsx"}:
         result["pages"], result["images"] = _office_counts(path)
-        result["needs_ocr"] = result["images"] > 0
+        result["image_text_translation"] = "enabled" if TRANSLATE_OFFICE_IMAGE_TEXT else "disabled"
     elif ext == ".pdf":
         try:
             import fitz
@@ -176,7 +196,8 @@ def _office_extract(path: Path, temp_dir: Path) -> tuple[Path, list[dict]]:
         units.append({"stable_key":str(item["count_src"]),"page":page if isinstance(page,int) else None,
                       "object_ref":str(page or item.get("type", "")),"unit_type":item.get("type", "text"),
                       "source_text":str(item.get("value", "")),"confidence":None,"source_payload":item})
-    units.extend(_office_ocr_units(path,len(units)))
+    if TRANSLATE_OFFICE_IMAGE_TEXT:
+        units.extend(_office_ocr_units(path,len(units)))
     return json_path, units
 
 
@@ -285,9 +306,12 @@ def _redraw_media(content: bytes, regions: list[tuple[dict,str]], suffix: str) -
 def _apply_office_ocr(output: Path, units: list[dict]) -> None:
     by_part={}
     for unit in units:
-        if unit.get("unit_type") != "office_image_ocr":
+        if unit.get("unit_type") != "office_image_ocr" or unit.get("status") == "skipped_image":
             continue
-        by_part.setdefault(unit["source_payload"]["media_part"],[]).append((unit["source_payload"],unit.get("human_text") or unit.get("machine_text") or unit["source_text"]))
+        translated = unit.get("human_text") or unit.get("machine_text")
+        if not translated:
+            continue
+        by_part.setdefault(unit["source_payload"]["media_part"],[]).append((unit["source_payload"],translated))
     if not by_part:
         return
     temp=output.with_suffix(output.suffix+".ocr.tmp")
@@ -320,7 +344,8 @@ def rebuild(source: Path, source_json: Path | None, units: list[dict], result_di
         from core.pipelines.excel_translation_pipeline import write_translated_content_to_excel
         output=Path(write_translated_content_to_excel(str(source),str(source_json),str(dst_json),str(result_dir),False,False,source_lang,target_lang))
         _apply_office_ocr(output,units); return output
-    output = result_dir / f"{source.stem}_zh{ext}"
+    target_suffix = {"Chinese": "zh", "English": "en"}.get(target_lang, target_lang.casefold().replace(" ", "_"))
+    output = result_dir / f"{source.stem}_{target_suffix}{ext}"
     values = {u["stable_key"]:u.get("human_text") or u.get("machine_text") or u["source_text"] for u in units}
     if ext == ".pdf":
         import fitz
@@ -363,10 +388,91 @@ def rebuild(source: Path, source_json: Path | None, units: list[dict], result_di
     return output
 
 
+def _render_pptx_with_powerpoint(source: Path, page_number: int, target: Path) -> bool:
+    """Use a short-lived helper: Office COM must not live in the web worker."""
+    helper = Path(__file__).resolve().parent.parent / "scripts" / "render_ppt_preview.py"
+    if not helper.exists() or os.name != "nt":
+        return False
+    try:
+        run = subprocess.run([sys.executable, str(helper), str(source), str(target), str(page_number)],
+                             capture_output=True, text=True, timeout=120, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return run.returncode == 0 and target.exists() and target.stat().st_size > 0
+
+
+def _render_pptx_deck_with_powerpoint(source: Path, cache_dir: Path) -> bool:
+    """Render every slide in one isolated Office process, not one process/page."""
+    helper = Path(__file__).resolve().parent.parent / "scripts" / "render_ppt_preview.py"
+    if not helper.exists() or os.name != "nt":
+        return False
+    try:
+        run = subprocess.run([sys.executable, str(helper), str(source), str(cache_dir), "all"],
+                             capture_output=True, text=True, timeout=300, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return run.returncode == 0 and (cache_dir / "page-1-rendered.png").exists()
+
+
+def _render_pptx_with_libreoffice(source: Path, page_number: int, cache_dir: Path) -> Path | None:
+    """Cloud-safe renderer used on Ubuntu VPS deployments when LibreOffice exists."""
+    soffice = shutil.which("soffice")
+    if not soffice:
+        return None
+    pdf = cache_dir / f"{source.stem}-rendered.pdf"
+    if not pdf.exists():
+        try:
+            run = subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", str(cache_dir), str(source)],
+                                 capture_output=True, text=True, timeout=120, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        generated = cache_dir / f"{source.stem}.pdf"
+        if run.returncode != 0 or not generated.exists():
+            return None
+        generated.replace(pdf)
+    return render_preview(pdf, page_number, cache_dir / "pdf-render")
+
+
+def prepare_preview_cache(source: Path, cache_dir: Path, pages: int) -> None:
+    """Pre-render the deliverable once so review-page navigation is instant.
+
+    On Windows the helper opens PowerPoint only once for the entire deck. On a
+    VPS, LibreOffice converts the deck to a PDF once and PyMuPDF renders each
+    page locally. Failures are intentionally non-fatal: on-demand preview still
+    remains available as a fallback.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if pages < 1 or source.suffix.lower() != ".pptx":
+        return
+    if all((cache_dir / f"page-{page}-rendered.png").exists() for page in range(1, pages + 1)):
+        return
+    if _render_pptx_deck_with_powerpoint(source, cache_dir):
+        return
+    soffice = shutil.which("soffice")
+    if not soffice:
+        return
+    try:
+        run = subprocess.run([soffice, "--headless", "--convert-to", "pdf", "--outdir", str(cache_dir), str(source)],
+                             capture_output=True, text=True, timeout=300, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    pdf = cache_dir / f"{source.stem}.pdf"
+    if run.returncode != 0 or not pdf.exists():
+        return
+    try:
+        import fitz
+        doc = fitz.open(pdf)
+        for page in range(1, min(pages, len(doc)) + 1):
+            doc[page - 1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).save(cache_dir / f"page-{page}-rendered.png")
+        doc.close()
+    except Exception:
+        return
+
+
 def render_preview(source: Path, page_number: int, cache_dir: Path) -> Path:
     """Render one page without executing document macros or embedded links."""
     cache_dir.mkdir(parents=True,exist_ok=True)
-    target=cache_dir/f"page-{page_number}.png"
+    target=cache_dir/f"page-{page_number}-rendered.png"
     if target.exists(): return target
     ext=source.suffix.lower()
     if ext == ".pdf":
@@ -377,6 +483,15 @@ def render_preview(source: Path, page_number: int, cache_dir: Path) -> Path:
         pix=doc[page_number-1].get_pixmap(matrix=fitz.Matrix(1.5,1.5),alpha=False)
         pix.save(target); doc.close(); return target
     if ext == ".pptx":
+        # The native/LibreOffice paths render the actual deck: backgrounds, theme,
+        # shapes, font metrics and positions match the downloadable PPTX.
+        if _render_pptx_with_powerpoint(source, page_number, target):
+            return target
+        rendered = _render_pptx_with_libreoffice(source, page_number, cache_dir)
+        if rendered:
+            return rendered
+        # Last-resort preview for developer environments without a renderer.
+        # It is intentionally not used on a properly provisioned VPS.
         try:
             from pptx import Presentation
             from pptx.enum.shapes import MSO_SHAPE_TYPE

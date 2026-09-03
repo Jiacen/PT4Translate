@@ -6,7 +6,7 @@ import traceback
 from pathlib import Path
 
 from . import db
-from .documents import convert_legacy, extract_units, preflight, rebuild
+from .documents import TRANSLATE_OFFICE_IMAGE_TEXT, convert_legacy, extract_units, preflight, prepare_preview_cache, rebuild
 from .providers import TranslationRequest, translate
 from .storage import checksum, file_dir
 from .terminology import Term, TerminologyEngine, normalize, residual_source_issues
@@ -49,16 +49,47 @@ def prepare_file(file_id: str) -> None:
                 conn.execute("INSERT OR REPLACE INTO translation_units(id,file_id,stable_key,page,object_ref,unit_type,source_text,status,confidence,source_payload_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                              (uid,file_id,unit["stable_key"],unit.get("page"),unit.get("object_ref"),unit.get("unit_type","text"),unit["source_text"],"pending_translation",unit.get("confidence"),json.dumps(unit.get("source_payload",{}),ensure_ascii=False),now))
             conn.execute("UPDATE files SET status='ready',preflight_json=?,error=NULL,updated_at=? WHERE id=?",(json.dumps(pf,ensure_ascii=False),now,file_id))
+        start_automatic_translation(file_id)
     except Exception as exc:
         db.execute("UPDATE files SET status='failed',error=?,updated_at=? WHERE id=?",(str(exc),db.utcnow(),file_id))
         raise
 
 
-def _terms(project_id: str | None) -> tuple[list[dict],TerminologyEngine]:
+def start_automatic_translation(file_id: str) -> None:
+    revision = db.scalar("SELECT COALESCE(MAX(revision),0) FROM translation_units WHERE file_id=?", (file_id,))
+    key = f"translate:{file_id}:{revision}:default"
+    if db.row("SELECT id FROM tasks WHERE idempotency_key=?", (key,)):
+        return
+    tid, now = db.new_id(), db.utcnow()
+    db.execute("INSERT INTO tasks(id,file_id,task_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+               (tid, file_id, "translate", "queued", key, now, now))
+    run_translation(tid)
+
+
+def refresh_machine_version(file_id: str) -> str | None:
+    file = db.row("SELECT * FROM files WHERE id=?", (file_id,))
+    if not file or file["status"] not in {"review", "published"}:
+        return None
+    source_v = _version(file_id, "working") or _version(file_id, "original")
+    source_json_path = (file.get("preflight") or {}).get("source_json")
+    units = db.rows("SELECT * FROM translation_units WHERE file_id=? ORDER BY CAST(stable_key AS INTEGER),stable_key", (file_id,))
+    output = rebuild(Path(source_v["path"]), Path(source_json_path) if source_json_path else None, units,
+                     file_dir(file_id) / "machine", file["source_language"], file["target_language"])
+    version_id = add_version(file_id, "machine", output, {"generated_from": "machine_and_review"})
+    try:
+        prepare_preview_cache(output, file_dir(file_id) / "previews", int((file.get("preflight") or {}).get("pages") or 0))
+    except Exception:
+        pass
+    return version_id
+
+
+def _terms(project_id: str | None, source_language: str, target_language: str) -> tuple[list[dict],TerminologyEngine]:
     if project_id:
         records = db.rows("SELECT * FROM glossary_terms WHERE project_id IS NULL OR project_id=?",(project_id,))
     else:
         records = db.rows("SELECT * FROM glossary_terms WHERE project_id IS NULL")
+    if source_language == "Chinese" and target_language == "English":
+        records = [{**r, "source": r["target"], "target": r["source"], "aliases": r.get("chinese_aliases") or []} for r in records]
     terms = [Term(r["id"],r["source"],r["target"],tuple(r.get("aliases") or []),r["mode"],bool(r["case_sensitive"])) for r in records]
     return records,TerminologyEngine(terms)
 
@@ -72,7 +103,14 @@ def run_translation(task_id: str, provider_id: str | None = None) -> None:
         if not provider:
             raise RuntimeError("没有启用的默认 Provider")
         units = db.rows("SELECT * FROM translation_units WHERE file_id=? ORDER BY CAST(stable_key AS INTEGER),stable_key",(file["id"],))
-        term_records,engine = _terms(file.get("project_id"))
+        if not TRANSLATE_OFFICE_IMAGE_TEXT:
+            image_unit_ids = [unit["id"] for unit in units if unit["unit_type"] == "office_image_ocr"]
+            if image_unit_ids:
+                placeholders = ",".join("?" for _ in image_unit_ids)
+                db.execute(f"UPDATE translation_units SET machine_text=NULL,human_text=NULL,status='skipped_image',qa_json='[]',updated_at=? WHERE id IN ({placeholders})",
+                           (db.utcnow(), *image_unit_ids))
+                units = [unit for unit in units if unit["unit_type"] != "office_image_ocr"]
+        term_records,engine = _terms(file.get("project_id"),file["source_language"],file["target_language"])
         memory = db.rows("SELECT source,target FROM translation_memory WHERE project_id IS ? LIMIT 100",(file.get("project_id"),))
         pending, protected_map, direct = [],{},{}
         tm = {m["source_norm"]:m["target"] for m in db.rows("SELECT source_norm,target FROM translation_memory WHERE project_id IS ?",(file.get("project_id"),))}
@@ -95,6 +133,10 @@ def run_translation(task_id: str, provider_id: str | None = None) -> None:
                              (translated,status,json.dumps(issues,ensure_ascii=False),db.utcnow(),unit["id"]))
             conn.execute("UPDATE files SET status='review',error=NULL,updated_at=? WHERE id=?",(db.utcnow(),file["id"]))
             conn.execute("UPDATE tasks SET status='completed',progress=1,detail='翻译完成，等待校对',updated_at=? WHERE id=?",(db.utcnow(),task_id))
+        try:
+            refresh_machine_version(file["id"])
+        except Exception as exc:
+            db.execute("UPDATE files SET error=?,updated_at=? WHERE id=?", (f"校对预览生成失败：{exc}", db.utcnow(), file["id"]))
     except Exception as exc:
         db.execute("UPDATE tasks SET status='failed',detail=?,updated_at=? WHERE id=?",(str(exc),db.utcnow(),task_id))
         db.execute("UPDATE files SET status='failed',error=?,updated_at=? WHERE id=?",(str(exc),db.utcnow(),file["id"]))

@@ -9,7 +9,8 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 
-HEADERS = ("源术语", "强制译法", "源术语别名（逗号分隔）")
+HEADERS = ("英文术语", "中文标准译法", "英文别名（逗号分隔）", "中文别名（逗号分隔，可选）")
+LEGACY_HEADERS = ("源术语", "强制译法", "源术语别名（逗号分隔）")
 SHEET_NAME = "术语表"
 MAX_IMPORT_BYTES = 5 * 1024 * 1024
 MAX_IMPORT_ROWS = 5_000
@@ -39,20 +40,22 @@ def export_global_terms(terms: list[dict]) -> bytes:
         cell.alignment = Alignment(horizontal="center")
     for term in terms:
         sheet.append((_excel_text(term["source"]), _excel_text(term["target"]),
-                      _excel_text(", ".join(term.get("aliases") or []))))
+                      _excel_text(", ".join(term.get("aliases") or [])),
+                      _excel_text(", ".join(term.get("chinese_aliases") or []))))
     sheet.freeze_panes = "A2"
-    sheet.auto_filter.ref = f"A1:C{max(1, sheet.max_row)}"
+    sheet.auto_filter.ref = f"A1:D{max(1, sheet.max_row)}"
     sheet.column_dimensions["A"].width = 32
     sheet.column_dimensions["B"].width = 32
     sheet.column_dimensions["C"].width = 42
+    sheet.column_dimensions["D"].width = 42
 
     instructions = workbook.create_sheet("填写说明")
     instructions.append(("使用说明",))
     instructions["A1"].font = Font(bold=True, color="FFFFFF")
     instructions["A1"].fill = PatternFill("solid", fgColor="008A96")
-    instructions.append(("请在“术语表”中填写；源术语和强制译法为必填项。",))
-    instructions.append(("别名仅用于识别同一源术语的不同写法，多个别名以英文或中文逗号分隔。",))
-    instructions.append(("导入时重复的源术语不会覆盖现有全局术语，而会被跳过。",))
+    instructions.append(("请在“术语表”中填写；英文术语和中文标准译法为必填项。",))
+    instructions.append(("英文别名用于识别同一英文术语的不同写法；中文别名用于中文→英文翻译时识别不同中文写法。多个别名以英文或中文逗号分隔。",))
+    instructions.append(("导入时重复的英文术语不会覆盖现有全局术语，而会被跳过。",))
     instructions.column_dimensions["A"].width = 90
 
     output = BytesIO()
@@ -91,25 +94,28 @@ def parse_global_terms(content: bytes) -> tuple[list[dict[str, object]], list[st
     try:
         sheet = workbook[SHEET_NAME] if SHEET_NAME in workbook.sheetnames else workbook.active
         header = tuple(_import_text(cell.value) for cell in next(sheet.iter_rows(min_row=1, max_row=1)))
-        if header[:len(HEADERS)] != HEADERS:
-            raise HTTPException(400, "术语表表头必须为：源术语、强制译法、源术语别名（逗号分隔）")
+        is_legacy = header[:len(LEGACY_HEADERS)] == LEGACY_HEADERS
+        if header[:len(HEADERS)] != HEADERS and not is_legacy:
+            raise HTTPException(400, "术语表表头必须为：英文术语、中文标准译法、英文别名（逗号分隔）、中文别名（逗号分隔，可选）")
         terms: list[dict[str, object]] = []
         errors: list[str] = []
         seen: set[str] = set()
-        for row_number, row in enumerate(sheet.iter_rows(min_row=2, max_col=3), start=2):
+        for row_number, row in enumerate(sheet.iter_rows(min_row=2, max_col=3 if is_legacy else 4), start=2):
             if row_number > MAX_IMPORT_ROWS + 1:
                 raise HTTPException(400, f"单次最多导入 {MAX_IMPORT_ROWS} 条术语")
             if any(cell.data_type == "f" for cell in row):
                 errors.append(f"第 {row_number} 行：不允许使用 Excel 公式")
                 continue
-            source, target, aliases = (_import_text(cell.value) for cell in row)
-            if not source and not target and not aliases:
+            values = tuple(_import_text(cell.value) for cell in row)
+            source, target, aliases = values[:3]
+            chinese_aliases = "" if is_legacy else values[3]
+            if not source and not target and not aliases and not chinese_aliases:
                 continue
             if not source or not target:
-                errors.append(f"第 {row_number} 行：源术语和强制译法均为必填项")
+                errors.append(f"第 {row_number} 行：英文术语和中文标准译法均为必填项")
                 continue
             if len(source) > 500 or len(target) > 500:
-                errors.append(f"第 {row_number} 行：源术语或强制译法超过 500 个字符")
+                errors.append(f"第 {row_number} 行：英文术语或中文标准译法超过 500 个字符")
                 continue
             key = source.casefold()
             if key in seen:
@@ -117,7 +123,8 @@ def parse_global_terms(content: bytes) -> tuple[list[dict[str, object]], list[st
                 continue
             seen.add(key)
             alias_items = tuple(dict.fromkeys(item.strip() for item in aliases.replace("，", ",").split(",") if item.strip()))
-            terms.append({"source": source, "target": target, "aliases": alias_items})
+            chinese_alias_items = tuple(dict.fromkeys(item.strip() for item in chinese_aliases.replace("，", ",").split(",") if item.strip()))
+            terms.append({"source": source, "target": target, "aliases": alias_items, "chinese_aliases": chinese_alias_items})
         return terms, errors
     finally:
         workbook.close()

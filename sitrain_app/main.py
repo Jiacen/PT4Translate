@@ -16,12 +16,15 @@ from . import __version__, db
 from .config import ROOT, ensure_data_dirs
 from .documents import render_preview
 from .glossary_excel import export_global_terms, parse_global_terms
-from .pipeline import add_version, prepare_file, publish, run_translation
+from .pipeline import add_version, prepare_file, publish, refresh_machine_version, run_translation, start_automatic_translation
+from .providers import ProviderError, TranslationRequest, translate
 from .storage import checksum, file_dir, save_upload
 from .sync import apply_sync, create_mappings
 from .terminology import normalize
 
 STATIC = Path(__file__).parent/"static"
+SOURCE_LANGUAGES = {"auto", "Chinese", "English", "German", "French", "Italian", "Spanish"}
+TARGET_LANGUAGES = {"Chinese", "English"}
 
 
 @asynccontextmanager
@@ -31,6 +34,8 @@ async def lifespan(_app: FastAPI):
         threading.Thread(target=run_translation,args=(task["id"],),daemon=True).start()
     for file in db.rows("SELECT id FROM files WHERE status='preflight'"):
         threading.Thread(target=prepare_file,args=(file["id"],),daemon=True).start()
+    for file in db.rows("SELECT id FROM files WHERE status='ready'"):
+        threading.Thread(target=start_automatic_translation,args=(file["id"],),daemon=True).start()
     yield
 
 
@@ -64,11 +69,19 @@ class ProviderIn(BaseModel):
     config: dict = {}
 
 
+class ProviderCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    base_url: str = Field(min_length=8, max_length=500)
+    model: str = Field(min_length=1, max_length=160)
+    api_key: str | None = None
+
+
 class TermIn(BaseModel):
     project_id: str | None = None
     source: str
     target: str
     aliases: list[str] = []
+    chinese_aliases: list[str] = []
     mode: str = "required"
     case_sensitive: bool = False
 
@@ -80,15 +93,25 @@ class MappingPatch(BaseModel):
 
 @app.get("/api/health")
 def health():
-    return {"ok":True,"version":__version__,"baseline":"LinguaHaru v6.8.1 / b3f73b8"}
+    active = db.row("SELECT name,model,api_key,last_test_status FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1")
+    if not active:
+        llm = {"status":"neutral", "label":"LLM 未选择"}
+    elif not active["api_key"]:
+        llm = {"status":"neutral", "label":"LLM 未配置"}
+    else:
+        state = active.get("last_test_status", "untested")
+        status = {"success":"online", "failed":"error"}.get(state, "warning")
+        text = {"online":"已验证", "error":"连接失败", "warning":"待测试"}[status]
+        llm = {"status":status, "label":active["name"]}
+    return {"ok":True,"version":__version__,"llm":llm}
 
 
 @app.get("/api/dashboard")
 def dashboard():
     return {"projects":db.rows("SELECT p.*,(SELECT COUNT(*) FROM chapters c WHERE c.project_id=p.id) chapter_count FROM projects p ORDER BY updated_at DESC"),
             "files":db.rows("SELECT * FROM files ORDER BY updated_at DESC LIMIT 100"),
-            "tasks":db.rows("SELECT * FROM tasks ORDER BY updated_at DESC LIMIT 50"),
-            "counts":{"pending_review":db.scalar("SELECT COUNT(*) FROM translation_units WHERE status IN ('pending_review','terminology_issue','modified')"),
+            "tasks":db.rows("SELECT * FROM tasks WHERE status IN ('queued','running') ORDER BY updated_at DESC LIMIT 50"),
+            "counts":{"pending_review":db.scalar("SELECT COUNT(*) FROM files WHERE status='review'"),
                       "published":db.scalar("SELECT COUNT(*) FROM files WHERE status='published'")}}
 
 
@@ -119,7 +142,13 @@ def chapter_create(project_id: str,body: ChapterIn):
 
 
 @app.post("/api/files/upload")
-async def upload(background: BackgroundTasks,upload: UploadFile=File(...),project_id: str|None=Form(None),chapter_id: str|None=Form(None),source_language: str=Form("English"),target_language: str=Form("Chinese")):
+async def upload(background: BackgroundTasks,upload: UploadFile=File(...),project_id: str|None=Form(None),chapter_id: str|None=Form(None),source_language: str=Form("auto"),target_language: str=Form("Chinese")):
+    if source_language not in SOURCE_LANGUAGES:
+        raise HTTPException(422, "源语言仅支持自动识别、中文、英文、德文、法文、意大利文或西班牙文")
+    if target_language not in TARGET_LANGUAGES:
+        raise HTTPException(422, "目标语言仅支持中文或英文")
+    if source_language != "auto" and source_language == target_language:
+        raise HTTPException(422, "源语言与目标语言不能相同；混合语言文档请使用自动识别")
     if bool(project_id) != bool(chapter_id): raise HTTPException(400,"教材模式必须同时指定项目和章节")
     if chapter_id and not db.row("SELECT id FROM chapters WHERE id=? AND project_id=?",(chapter_id,project_id)): raise HTTPException(404,"章节不存在或不属于该项目")
     fid,now = db.new_id(),db.utcnow(); path=await save_upload(upload,fid); ext=path.suffix.lower()
@@ -151,14 +180,14 @@ def units(file_id: str,status: str|None=None):
 def file_preview(file_id: str,page_number: int):
     file=db.row("SELECT * FROM files WHERE id=?",(file_id,))
     if not file: raise HTTPException(404,"文件不存在")
-    version=db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type IN ('published','working','original') ORDER BY CASE version_type WHEN 'published' THEN 1 WHEN 'working' THEN 2 ELSE 3 END,sequence DESC LIMIT 1",(file_id,))
+    version=db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type IN ('published','machine','working','original') ORDER BY CASE version_type WHEN 'published' THEN 1 WHEN 'machine' THEN 2 WHEN 'working' THEN 3 ELSE 4 END,sequence DESC LIMIT 1",(file_id,))
     try: path=render_preview(Path(version["path"]),page_number,file_dir(file_id)/"previews")
     except RuntimeError as exc: raise HTTPException(409,str(exc)) from exc
     return FileResponse(path,media_type="image/png")
 
 
 @app.patch("/api/units/{unit_id}")
-def unit_patch(unit_id: str,body: UnitPatch):
+def unit_patch(unit_id: str,body: UnitPatch,background: BackgroundTasks):
     current=db.row("SELECT * FROM translation_units WHERE id=?",(unit_id,))
     if not current: raise HTTPException(404,"翻译单元不存在")
     if current["revision"]!=body.revision: raise HTTPException(409,"该译文已被其他修改更新，请刷新后重试")
@@ -169,6 +198,7 @@ def unit_patch(unit_id: str,body: UnitPatch):
         file=db.row("SELECT project_id FROM files WHERE id=?",(current["file_id"],))
         db.execute("INSERT INTO translation_memory(id,project_id,source_norm,source,target,origin_unit_id,approved_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id,source_norm) DO UPDATE SET target=excluded.target,origin_unit_id=excluded.origin_unit_id,approved_at=excluded.approved_at",
                    (db.new_id(),file.get("project_id"),normalize(current["source_text"]),current["source_text"],text,unit_id,db.utcnow()))
+    background.add_task(refresh_machine_version, current["file_id"])
     return db.row("SELECT * FROM translation_units WHERE id=?",(unit_id,))
 
 
@@ -202,20 +232,62 @@ def download(version_id: str):
 
 @app.get("/api/providers")
 def provider_list():
-    records=db.rows("SELECT * FROM providers ORDER BY name")
-    for r in records: r["api_key_configured"]=bool(r.pop("api_key", "")); r.pop("api_key",None)
+    records=db.rows("SELECT * FROM providers WHERE id<>'custom' ORDER BY CASE id WHEN 'qwen-mt' THEN 1 WHEN 'deepseek' THEN 2 WHEN 'kimi' THEN 3 ELSE 4 END,name")
+    for r in records:
+        r["api_key_configured"]=bool(r.pop("api_key", "")); r.pop("api_key",None)
+        r["is_active"] = bool(r["enabled"] and r["is_default"])
     return {"providers":records}
 
 
 @app.put("/api/providers/{provider_id}")
 def provider_save(provider_id: str,body: ProviderIn):
     current=db.row("SELECT * FROM providers WHERE id=?",(provider_id,))
-    if not current: raise HTTPException(404,"Provider 不存在")
-    if body.is_default: db.execute("UPDATE providers SET is_default=0")
+    if not current or provider_id == "custom": raise HTTPException(404,"Provider 不存在")
     key=current["api_key"] if body.api_key is None or body.api_key=="" else body.api_key
-    db.execute("UPDATE providers SET name=?,protocol=?,base_url=?,api_key=?,model=?,enabled=?,is_default=?,is_fallback=?,config_json=?,updated_at=? WHERE id=?",
-               (body.name,body.protocol,body.base_url,key,body.model,int(body.enabled),int(body.is_default),int(body.is_fallback),json.dumps(body.config,ensure_ascii=False),db.utcnow(),provider_id))
+    activate = bool(body.enabled and body.is_default)
+    if activate and not key:
+        raise HTTPException(422,"请先填写 API Key，才能设为当前翻译服务")
+    with db.connect() as conn:
+        if activate:
+            conn.execute("UPDATE providers SET enabled=0,is_default=0 WHERE id<>?",(provider_id,))
+        conn.execute("UPDATE providers SET name=?,protocol=?,base_url=?,api_key=?,model=?,enabled=?,is_default=?,is_fallback=?,config_json=?,updated_at=? WHERE id=?",
+                     (body.name,body.protocol,body.base_url,key,body.model,int(activate),int(activate),int(body.is_fallback),json.dumps(body.config,ensure_ascii=False),db.utcnow(),provider_id))
     return {"ok":True}
+
+
+@app.post("/api/providers")
+def provider_create(body: ProviderCreate):
+    provider_id = f"custom-{db.new_id()[:12]}"
+    db.execute("INSERT INTO providers(id,name,protocol,base_url,api_key,model,enabled,is_default,is_fallback,config_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+               (provider_id,body.name,"openai_chat",body.base_url.rstrip("/"),body.api_key or "",body.model,0,0,0,
+                json.dumps({"temperature":0.1,"batch_size":20,"concurrency":2,"rpm":0,"timeout":120,"retries":3,"backoff":2,"structured_output":True,"headers":{},"prompt":"Translate each item faithfully from {source_lang} into {target_lang}. Return only a JSON object using the same keys."},ensure_ascii=False),db.utcnow()))
+    return {"id":provider_id}
+
+
+@app.delete("/api/providers/{provider_id}")
+def provider_delete(provider_id: str):
+    provider = db.row("SELECT id,is_default FROM providers WHERE id=?", (provider_id,))
+    if not provider or not provider_id.startswith("custom-"):
+        raise HTTPException(404, "仅可删除自定义 Provider")
+    db.execute("DELETE FROM providers WHERE id=?", (provider_id,))
+    return {"ok": True, "was_active": bool(provider["is_default"])}
+
+
+@app.post("/api/providers/{provider_id}/test")
+def provider_test(provider_id: str):
+    provider = db.row("SELECT * FROM providers WHERE id=?",(provider_id,))
+    if not provider or provider_id == "custom": raise HTTPException(404,"Provider 不存在")
+    if not provider.get("api_key"):
+        raise HTTPException(422,"尚未配置 API Key")
+    try:
+        translate(provider,TranslationRequest([("connection-check","Connection test")],"English","Chinese",[],[]))
+    except ProviderError as exc:
+        db.execute("UPDATE providers SET last_test_status='failed',last_tested_at=?,last_test_message=?,updated_at=? WHERE id=?",
+                   (db.utcnow(),str(exc)[:300],db.utcnow(),provider_id))
+        raise HTTPException(502,f"连接失败：{exc}") from exc
+    db.execute("UPDATE providers SET last_test_status='success',last_tested_at=?,last_test_message='',updated_at=? WHERE id=?",
+               (db.utcnow(),db.utcnow(),provider_id))
+    return {"ok":True,"message":"连接成功"}
 
 
 @app.get("/api/glossary")
@@ -225,8 +297,8 @@ def glossary(project_id: str|None=None):
 
 @app.post("/api/glossary")
 def glossary_add(body: TermIn):
-    tid=db.new_id(); db.execute("INSERT INTO glossary_terms(id,project_id,source,target,aliases_json,mode,case_sensitive,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                               (tid,body.project_id,body.source,body.target,json.dumps(body.aliases,ensure_ascii=False),body.mode,int(body.case_sensitive),db.utcnow()))
+    tid=db.new_id(); db.execute("INSERT INTO glossary_terms(id,project_id,source,target,aliases_json,chinese_aliases_json,mode,case_sensitive,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                               (tid,body.project_id,body.source,body.target,json.dumps(body.aliases,ensure_ascii=False),json.dumps(body.chinese_aliases,ensure_ascii=False),body.mode,int(body.case_sensitive),db.utcnow()))
     return db.row("SELECT * FROM glossary_terms WHERE id=?",(tid,))
 
 
@@ -252,8 +324,8 @@ async def glossary_import(upload: UploadFile = File(...)):
             if key in existing:
                 skipped += 1
                 continue
-            conn.execute("INSERT INTO glossary_terms(id,project_id,source,target,aliases_json,mode,case_sensitive,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                         (db.new_id(), None, source, str(term["target"]), json.dumps(term["aliases"], ensure_ascii=False), "required", 0, db.utcnow()))
+            conn.execute("INSERT INTO glossary_terms(id,project_id,source,target,aliases_json,chinese_aliases_json,mode,case_sensitive,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                         (db.new_id(), None, source, str(term["target"]), json.dumps(term["aliases"], ensure_ascii=False), json.dumps(term["chinese_aliases"], ensure_ascii=False), "required", 0, db.utcnow()))
             existing.add(key)
             added += 1
     return {"added": added, "skipped": skipped, "invalid": len(errors), "errors": errors[:20]}

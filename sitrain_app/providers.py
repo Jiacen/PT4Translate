@@ -5,6 +5,8 @@ import os
 import random
 import re
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Callable
 
@@ -29,6 +31,26 @@ def _key(config: dict) -> str:
     return os.getenv(env_name, "") if env_name else config.get("api_key", "")
 
 
+class _RateLimiter:
+    """Small, provider-local start-rate limiter shared by concurrent Qwen calls."""
+
+    def __init__(self, requests_per_minute: int):
+        self.interval = 60.0 / requests_per_minute if requests_per_minute > 0 else 0.0
+        self.next_start = 0.0
+        self.lock = threading.Lock()
+
+    def wait(self) -> None:
+        if not self.interval:
+            return
+        with self.lock:
+            now = time.monotonic()
+            scheduled = max(now, self.next_start)
+            self.next_start = scheduled + self.interval
+        delay = scheduled - now
+        if delay > 0:
+            time.sleep(delay)
+
+
 def _post(config: dict, payload: dict) -> dict:
     key = _key(config)
     if not key:
@@ -41,6 +63,12 @@ def _post(config: dict, payload: dict) -> dict:
         try:
             response = requests.post(url,headers=headers,json=payload,timeout=float(settings.get("timeout",120)))
             if response.status_code >= 400:
+                retry_after = response.headers.get("Retry-After") if response.status_code == 429 else None
+                if retry_after:
+                    try:
+                        time.sleep(min(60.0, max(0.0, float(retry_after))))
+                    except ValueError:
+                        pass
                 raise ProviderError(f"HTTP {response.status_code}: {response.text[:300]}")
             return response.json()
         except (requests.RequestException, ValueError, ProviderError) as exc:
@@ -61,9 +89,13 @@ def _choice_text(response: dict) -> str:
 
 
 def translate_qwen(config: dict, request: TranslationRequest, progress: Callable[[int,int],None]) -> dict[str,str]:
-    output = {}
     settings = config.get("config",{})
-    for index,(key,text) in enumerate(request.units,1):
+    # Qwen-MT accepts one source text per request.  Parallelise only the network
+    # calls, so each stable unit ID still maps to exactly one returned translation.
+    concurrency = min(8, max(1, int(settings.get("concurrency", 4))))
+    limiter = _RateLimiter(max(0, int(settings.get("rpm", 0))))
+
+    def translate_one(key: str, text: str) -> tuple[str, str]:
         options = {"source_lang":request.source_lang,"target_lang":request.target_lang}
         if request.terms:
             options["terms"] = [{"source":t["source"],"target":t["target"]} for t in request.terms[:50]]
@@ -73,8 +105,16 @@ def translate_qwen(config: dict, request: TranslationRequest, progress: Callable
             options["domains"] = settings["domains"]
         payload = {"model":config["model"],"messages":[{"role":"user","content":text}],
                    "temperature":settings.get("temperature",0.1),"translation_options":options}
-        output[key] = _choice_text(_post(config,payload))
-        progress(index,len(request.units))
+        limiter.wait()
+        return key, _choice_text(_post(config,payload))
+
+    output: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="qwen-mt") as executor:
+        futures = [executor.submit(translate_one, key, text) for key, text in request.units]
+        for completed, future in enumerate(as_completed(futures), 1):
+            key, translated = future.result()
+            output[key] = translated
+            progress(completed, len(request.units))
     return output
 
 
@@ -99,8 +139,9 @@ def translate_openai(config: dict, request: TranslationRequest, progress: Callab
         batch = request.units[offset:offset+batch_size]
         body = {key:text for key,text in batch}
         term_text = "\n".join(f"{t['source']} => {t['target']}" for t in request.terms)
-        prompt = settings.get("prompt") or "Translate each item faithfully into {target_lang}. Return only a JSON object using the same keys."
-        prompt = prompt.format(source_lang=request.source_lang,target_lang=request.target_lang)
+        prompt = settings.get("prompt") or "Translate each item faithfully from {source_lang} into {target_lang}. Return only a JSON object using the same keys."
+        source_name = "the automatically detected source language" if request.source_lang == "auto" else request.source_lang
+        prompt = prompt.format(source_lang=source_name,target_lang=request.target_lang)
         if term_text:
             prompt += "\nMandatory terminology:\n" + term_text
         payload = {"model":config["model"],"messages":[{"role":"system","content":prompt},

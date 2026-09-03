@@ -1228,6 +1228,21 @@ def _shrink_cell_font(paragraph, source_text: str, translated_text: str, namespa
                 pass
 
 
+def _is_table_cell(node) -> bool:
+    """Only table cells need explicit size reduction.
+
+    Applying it to ordinary text boxes made Chinese text visibly smaller even
+    when the original box had room to grow.  Text boxes retain their authored
+    size and use PowerPoint's native autofit only when it genuinely overflows.
+    """
+    current = node
+    while current is not None:
+        if isinstance(current.tag, str) and current.tag.endswith("}tc"):
+            return True
+        current = current.getparent()
+    return False
+
+
 def _distribute_text_to_runs(parent_element, translated_text: str, item: Dict, namespaces: Dict):
     """Distribute translated text across multiple runs, preserving spacing and structure."""
     text_runs = parent_element.xpath('.//a:r', namespaces=namespaces)
@@ -1252,8 +1267,9 @@ def _distribute_text_to_runs(parent_element, translated_text: str, item: Dict, n
     # spot every write-back path goes through (text boxes, tables, shapes, SmartArt,
     # masters, notes). Keeps a much-longer translation from overflowing on first
     # open / PDF export. The scope of `parent_element` always matches the item's.
-    _shrink_cell_font(parent_element, (item.get('value') or '').replace('␊', '').replace('␍', ''),
-                      translated_text, namespaces)
+    if _is_table_cell(parent_element):
+        _shrink_cell_font(parent_element, (item.get('value') or '').replace('␊', '').replace('␍', ''),
+                          translated_text, namespaces)
 
 def _simple_text_distribution(text_runs, translated_text: str, namespaces: Dict):
     """Fallback used when the recorded run structure doesn't match the live runs.
