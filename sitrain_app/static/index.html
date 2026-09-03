@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SITRAIN 教材智能翻译平台</title><link rel="stylesheet" href="/app.css"><link rel="stylesheet" href="/preview.css"></head>
+<body>
+<div id="login" class="login-shell">
+  <section class="login-panel"><div class="brand-mark">SITRAIN</div><h1>教材智能翻译与校对平台</h1><p>完整文件上传、翻译、校对、同步与交付，全部在平台内完成。</p><label>本地账号<input value="local-admin" disabled></label><button class="primary" onclick="enterApp()">进入本地工作台</button><small>阶段一 · 本地单用户模式</small></section>
+  <aside class="login-art"><span>Industrial learning,<br>translated with precision.</span></aside>
+</div>
+<div id="app" class="app hidden">
+  <aside class="sidebar"><div class="logo">SITRAIN <b>Translate</b></div><nav>
+    <button class="active" data-view="dashboard">工作台</button><button data-view="projects">教材项目</button><button data-view="review">待校对</button><button data-view="glossary">全局术语库</button><button data-view="history">历史与交付</button><button data-view="settings">管理设置</button>
+  </nav><div class="sidebar-foot"><span class="status-dot"></span> 本地服务正常<br><small id="version">正在连接…</small></div></aside>
+  <main><header><div><span class="eyebrow" id="eyebrow">OVERVIEW</span><h1 id="title">工作台</h1></div><button class="ghost" onclick="refreshAll()">刷新</button></header>
+    <div id="toast"></div>
+    <section id="view-dashboard" class="view active">
+      <div class="hero"><div><span class="eyebrow">END-TO-END WORKFLOW</span><h2>从完整教材到可交付中文版本</h2><p>原始文件永不覆盖。机翻、校对与发布版本独立保存。</p></div><div class="hero-actions"><button class="primary" onclick="openUpload(false)">＋ 单文件翻译</button><button class="secondary" onclick="switchView('projects')">新建教材项目</button></div></div>
+      <div class="metrics"><article><b id="m-projects">0</b><span>教材项目</span></article><article><b id="m-review">0</b><span>待校对条目</span></article><article><b id="m-published">0</b><span>已发布文件</span></article><article><b id="m-running">0</b><span>后台任务</span></article></div>
+      <div class="grid-2"><section class="card"><div class="card-head"><h3>最近文件</h3></div><div id="recent-files" class="list empty">暂无文件</div></section><section class="card"><div class="card-head"><h3>任务队列</h3></div><div id="task-list" class="list empty">暂无任务</div></section></div>
+    </section>
+    <section id="view-projects" class="view"><div class="toolbar"><button class="primary" onclick="newProject()">＋ 新建教材项目</button><button onclick="openUpload(false)">上传独立文件</button></div><div id="project-list" class="project-grid"></div><div id="project-detail" class="hidden"></div></section>
+    <section id="view-review" class="view"><div class="review-layout"><aside class="card file-nav"><h3>文件</h3><div id="review-files"></div></aside><section class="preview card" id="preview"><div class="preview-empty"><b>页面预览</b><span>选择文件后显示页码与对象定位</span></div></section><aside class="card editor"><div class="card-head"><h3>翻译单元</h3><select id="unit-filter" onchange="loadUnits(activeFile)"><option value="">全部</option><option value="terminology_issue">术语异常</option><option value="pending_review">待校对</option><option value="modified">已修改</option><option value="confirmed">已确认</option></select></div><div id="units" class="unit-list empty">请先选择文件</div></aside></div></section>
+    <section id="view-glossary" class="view"><div class="toolbar"><button class="primary" onclick="newTerm()">＋ 添加术语</button><button onclick="downloadGlossary()">⇩ 下载 Excel 模板/术语表</button><button onclick="$('#glossary-import').click()">⇧ 导入术语表</button><input id="glossary-import" class="hidden" type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onchange="importGlossary(this)"></div><p class="notice">全局术语适用于所有项目和单文件。下载的 Excel 在没有术语时提供空模板；已有术语时会一并导出。导入时不会覆盖已有的同名源术语。</p><section class="card"><table><thead><tr><th>源术语</th><th>强制译法</th><th>源术语别名</th></tr></thead><tbody id="term-table"></tbody></table></section></section>
+    <section id="view-history" class="view"><section class="card"><h3>文件版本与交付</h3><div id="history-list" class="list"></div></section></section>
+    <section id="view-settings" class="view"><div class="notice">API Key 仅保存在本机服务端，不返回浏览器、不写入日志。</div><div id="provider-list" class="provider-grid"></div></section>
+  </main>
+</div>
+<dialog id="upload-dialog"><form method="dialog" onsubmit="return false"><div class="dialog-head"><h2>上传完整文件</h2><button onclick="this.closest('dialog').close()">×</button></div><p>支持 PPT/PPTX、DOC/DOCX、XLS/XLSX、PDF、CSV/TSV、TXT/MD/JSON/HTML。</p><label class="drop"><input id="upload-file" type="file" required><b>选择文件</b><span>原件将以只读版本保存</span></label><div class="form-grid"><label>源语言<input id="source-lang" value="English"></label><label>目标语言<input id="target-lang" value="Chinese"></label><label>教材项目<select id="upload-project" onchange="loadUploadChapters()"><option value="">独立文件任务</option></select></label><label>章节<select id="upload-chapter" disabled><option value="">—</option></select></label></div><button class="primary full" onclick="submitUpload()">上传并预检</button></form></dialog>
+<dialog id="form-dialog"><form id="dynamic-form" method="dialog" onsubmit="return false"></form></dialog>
+<script src="/app.js"></script>
+</body></html>
