@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import zipfile
 from contextlib import asynccontextmanager
@@ -14,12 +15,13 @@ from pydantic import BaseModel, Field
 
 from . import __version__, db
 from .config import ROOT, ensure_data_dirs
-from .documents import render_preview
+from .documents import render_preview, word_page_objects
 from .ppt_review import page_objects
 from .review_versions import (apply_same_source, current_version, preview_source, reopen_review,
                               review_context, save_edit, save_review_memory, serialized)
 from .glossary_excel import export_global_terms, parse_global_terms
-from .pipeline import add_version, prepare_file, publish, refresh_machine_version, run_translation, start_automatic_translation
+from .pipeline import (add_version, prepare_file, publish, refresh_machine_version,
+                       run_translation, schedule_translation, start_automatic_translation)
 from .providers import ProviderError, TranslationRequest, translate
 from .storage import checksum, file_dir, save_upload
 from .sync import apply_sync, create_mappings
@@ -34,7 +36,7 @@ TARGET_LANGUAGES = {"Chinese", "English"}
 async def lifespan(_app: FastAPI):
     ensure_data_dirs(); db.init_db()
     for task in db.rows("SELECT id FROM tasks WHERE status='queued' AND task_type='translate'"):
-        threading.Thread(target=run_translation,args=(task["id"],),daemon=True).start()
+        schedule_translation(task["id"])
     for file in db.rows("SELECT id FROM files WHERE status='preflight'"):
         threading.Thread(target=prepare_file,args=(file["id"],),daemon=True).start()
     for file in db.rows("SELECT id FROM files WHERE status='ready'"):
@@ -113,6 +115,15 @@ class MappingPatch(BaseModel):
     confirmed: bool = True
 
 
+def _chapter_key(filename: str) -> str:
+    stem = Path(filename).stem.casefold()
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "_", stem).strip("_") or "unnamed"
+
+
+def _file_kind(extension: str) -> str:
+    return {".pptx":"powerpoint", ".ppt":"powerpoint", ".docx":"word", ".doc":"word", ".xlsx":"excel", ".xls":"excel", ".pdf":"pdf"}.get(extension, "text")
+
+
 @app.get("/api/health")
 def health():
     active = db.row("SELECT name,model,api_key,last_test_status FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1")
@@ -132,7 +143,7 @@ def health():
 def dashboard():
     return {"projects":db.rows("SELECT p.*,(SELECT COUNT(*) FROM chapters c WHERE c.project_id=p.id) chapter_count FROM projects p ORDER BY updated_at DESC"),
             "files":db.rows("SELECT * FROM files ORDER BY updated_at DESC LIMIT 100"),
-            "tasks":db.rows("SELECT * FROM tasks WHERE status IN ('queued','running') ORDER BY updated_at DESC LIMIT 50"),
+            "tasks":db.rows("SELECT t.*,f.original_name,f.extension,f.kind FROM tasks t LEFT JOIN files f ON f.id=t.file_id WHERE t.status IN ('queued','running') ORDER BY t.created_at LIMIT 50"),
             "counts":{"pending_review":db.scalar("SELECT COUNT(*) FROM files WHERE status='review'"),
                       "published":db.scalar("SELECT COUNT(*) FROM files WHERE status='published'")}}
 
@@ -174,12 +185,66 @@ async def upload(background: BackgroundTasks,upload: UploadFile=File(...),projec
     if bool(project_id) != bool(chapter_id): raise HTTPException(400,"教材模式必须同时指定项目和章节")
     if chapter_id and not db.row("SELECT id FROM chapters WHERE id=? AND project_id=?",(chapter_id,project_id)): raise HTTPException(404,"章节不存在或不属于该项目")
     fid,now = db.new_id(),db.utcnow(); path=await save_upload(upload,fid); ext=path.suffix.lower()
-    kind={".pptx":"powerpoint",".ppt":"powerpoint",".docx":"word",".doc":"word",".xlsx":"excel",".xls":"excel",".pdf":"pdf"}.get(ext,"text")
+    kind=_file_kind(ext)
     db.execute("INSERT INTO files(id,project_id,chapter_id,original_name,extension,kind,mode,status,source_language,target_language,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                (fid,project_id,chapter_id,path.name,ext,kind,"chapter" if chapter_id else "standalone","preflight",source_language,target_language,now,now))
     add_version(fid,"original",path,{"immutable":True})
     background.add_task(prepare_file,fid)
     return {"id":fid,"status":"preflight","name":path.name}
+
+
+@app.post("/api/projects/{project_id}/package-import")
+async def package_import(project_id: str, background: BackgroundTasks,
+                         word_files: list[UploadFile] = File(default=[]),
+                         ppt_files: list[UploadFile] = File(default=[]),
+                         source_language: str = Form("auto"), target_language: str = Form("Chinese")):
+    if not db.row("SELECT id FROM projects WHERE id=?", (project_id,)):
+        raise HTTPException(404, "教材项目不存在")
+    if not word_files and not ppt_files:
+        raise HTTPException(422, "请至少选择一个 Word 或 PPT 文件")
+    if source_language not in SOURCE_LANGUAGES or target_language not in TARGET_LANGUAGES:
+        raise HTTPException(422, "语言设置无效")
+    if source_language != "auto" and source_language == target_language:
+        raise HTTPException(422, "源语言与目标语言不能相同")
+    incoming = [("word", upload) for upload in word_files] + [("ppt", upload) for upload in ppt_files]
+    keys: dict[str, dict[str, list[UploadFile]]] = {}
+    for family, upload in incoming:
+        extension = Path(upload.filename or "").suffix.lower()
+        allowed = {".doc", ".docx"} if family == "word" else {".ppt", ".pptx"}
+        if extension not in allowed:
+            raise HTTPException(415, f"{upload.filename or '文件'} 不属于{'Word' if family == 'word' else 'PPT'}栏允许的格式")
+        key = _chapter_key(upload.filename or "")
+        keys.setdefault(key, {"word": [], "ppt": []})[family].append(upload)
+    duplicates = [key for key, group in keys.items() if len(group["word"]) > 1 or len(group["ppt"]) > 1]
+    if duplicates:
+        raise HTTPException(409, f"发现同一栏目中的重复章节文件：{', '.join(duplicates[:5])}")
+    existing = { _chapter_key(chapter["name"]): chapter for chapter in db.rows("SELECT * FROM chapters WHERE project_id=?", (project_id,)) }
+    created: dict[str, str] = {}
+    for key, group in keys.items():
+        chapter = existing.get(key)
+        if not chapter:
+            label = Path((group["word"] or group["ppt"])[0].filename or key).stem
+            pos = db.scalar("SELECT COALESCE(MAX(position),-1)+1 FROM chapters WHERE project_id=?", (project_id,))
+            chapter_id, now = db.new_id(), db.utcnow()
+            db.execute("INSERT INTO chapters(id,project_id,name,position,created_at,updated_at) VALUES(?,?,?,?,?,?)", (chapter_id, project_id, label, pos, now, now))
+        else:
+            chapter_id = chapter["id"]
+        created[key] = chapter_id
+    saved = []
+    for family, upload in incoming:
+        key, fid, now = _chapter_key(upload.filename or ""), db.new_id(), db.utcnow()
+        path = await save_upload(upload, fid)
+        ext = path.suffix.lower()
+        db.execute("INSERT INTO files(id,project_id,chapter_id,original_name,extension,kind,mode,status,source_language,target_language,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (fid, project_id, created[key], path.name, ext, _file_kind(ext), "chapter", "preflight", source_language, target_language, now, now))
+        add_version(fid, "original", path, {"immutable": True, "package_family": family})
+        background.add_task(prepare_file, fid)
+        saved.append({"id": fid, "chapter": created[key], "family": family, "name": path.name})
+    db.execute("UPDATE projects SET updated_at=? WHERE id=?", (db.utcnow(), project_id))
+    paired = sum(1 for group in keys.values() if group["word"] and group["ppt"])
+    return {"files": saved, "chapters_created": len(created), "paired_chapters": paired,
+            "word_only": sum(1 for group in keys.values() if group["word"] and not group["ppt"]),
+            "ppt_only": sum(1 for group in keys.values() if group["ppt"] and not group["word"])}
 
 
 @app.get("/api/files/{file_id}")
@@ -221,6 +286,21 @@ def ppt_objects(file_id: str, page_number: int):
     try:
         result = page_objects(str(source), source.stat().st_mtime_ns, page_number)
     except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {**result, "version_id": version["id"]}
+
+
+@app.get("/api/files/{file_id}/pages/{page_number}/word-objects")
+def word_objects(file_id: str, page_number: int):
+    file = db.row("SELECT * FROM files WHERE id=?", (file_id,))
+    if not file or file["kind"] != "word":
+        raise HTTPException(415, "当前页面对象编辑仅支持 Word 文件")
+    version = current_version(file_id)
+    source, cache = preview_source(version, page_number)
+    units = db.rows("SELECT * FROM translation_units WHERE file_id=?", (file_id,))
+    try:
+        result = word_page_objects(source, page_number, cache, units)
+    except (ValueError, RuntimeError) as exc:
         raise HTTPException(422, str(exc)) from exc
     return {**result, "version_id": version["id"]}
 
@@ -288,7 +368,7 @@ def translate_start(file_id: str,background: BackgroundTasks,provider_id: str|No
     existing=db.row("SELECT * FROM tasks WHERE idempotency_key=?",(key,))
     if existing and existing["status"] in {"queued","running","completed"}: return existing
     tid,now=db.new_id(),db.utcnow(); db.execute("INSERT INTO tasks(id,file_id,task_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",(tid,file_id,"translate","queued",key,now,now))
-    background.add_task(run_translation,tid,provider_id)
+    background.add_task(schedule_translation,tid,provider_id)
     return db.row("SELECT * FROM tasks WHERE id=?",(tid,))
 
 

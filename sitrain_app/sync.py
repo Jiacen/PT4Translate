@@ -43,12 +43,13 @@ def create_mappings(chapter_id: str) -> list[dict]:
     if not media:
         raise RuntimeError("Word 中未发现可映射的幻灯片图片")
     offset = max(0,slides-len(media))
+    count_gap = abs(slides-len(media))
     now = db.utcnow()
     with db.connect() as conn:
         for index,part in enumerate(media,1):
             slide_no = min(slides,index+offset)
-            confidence = 0.9 if slides-len(media) <= 3 else 0.7
-            conn.execute("INSERT INTO ppt_word_mappings(id,chapter_id,ppt_file_id,word_file_id,slide_number,media_part,confidence,confirmed,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(word_file_id,media_part) DO UPDATE SET slide_number=excluded.slide_number,confidence=excluded.confidence,updated_at=excluded.updated_at",
+            confidence = 0.9 if count_gap <= 3 else 0.7
+            conn.execute("INSERT INTO ppt_word_mappings(id,chapter_id,ppt_file_id,word_file_id,slide_number,media_part,confidence,confirmed,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(word_file_id,media_part) DO UPDATE SET slide_number=excluded.slide_number,confidence=excluded.confidence,confirmed=excluded.confirmed,updated_at=excluded.updated_at",
                          (db.new_id(),chapter_id,ppt["id"],word["id"],slide_no,part,confidence,1 if confidence>=0.85 else 0,now))
     return db.rows("SELECT * FROM ppt_word_mappings WHERE chapter_id=? ORDER BY slide_number",(chapter_id,))
 
@@ -60,8 +61,11 @@ def apply_sync(chapter_id: str) -> str:
     unconfirmed = [m for m in mappings if not m["confirmed"]]
     if unconfirmed:
         raise RuntimeError(f"仍有 {len(unconfirmed)} 条低置信度映射需要确认")
-    ppt_path = Path(_latest(mappings[0]["ppt_file_id"],"published","working","original")["path"])
-    word_path = Path(_latest(mappings[0]["word_file_id"],"published","working","original")["path"])
+    # Synchronization must use the completed translation/review versions.  The
+    # original pair is immutable input and would otherwise put English slides
+    # back into an already translated Word chapter.
+    ppt_path = Path(_latest(mappings[0]["ppt_file_id"],"review","machine","published","working","original")["path"])
+    word_path = Path(_latest(mappings[0]["word_file_id"],"review","machine","published","working","original")["path"])
     export_dir = file_dir(mappings[0]["word_file_id"])/"slide_exports"
     export_dir.mkdir(parents=True,exist_ok=True)
     try:

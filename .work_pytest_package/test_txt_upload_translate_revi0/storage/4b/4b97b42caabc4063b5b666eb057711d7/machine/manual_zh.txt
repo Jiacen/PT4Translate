@@ -1,0 +1,2 @@
+[机翻]Start the motor 24 V
+[机翻]Stop the motor

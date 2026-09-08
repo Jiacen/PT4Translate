@@ -130,6 +130,62 @@ def preflight(path: Path) -> dict[str, Any]:
     return result
 
 
+def document_page_count(source: Path, cache_dir: Path) -> int:
+    """Return a Word document's real printed-page count.
+
+    A DOCX package has no dependable page-count field.  Word is the layout
+    engine that defines pagination, so export a read-only PDF once and count
+    its pages.  The PDF is retained in the preview cache for later rendering.
+    """
+    if source.suffix.lower() != ".docx":
+        return 0
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    pdf = cache_dir / f"{source.stem}.pdf"
+    app = doc = None
+    initialized = False
+    try:
+        import fitz
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        initialized = True
+        if not pdf.exists() or pdf.stat().st_size == 0:
+            app = win32com.client.DispatchEx("Word.Application")
+            app.Visible = False
+            try:
+                app.AutomationSecurity = 3  # msoAutomationSecurityForceDisable
+            except Exception:
+                pass
+            doc = app.Documents.Open(str(source.resolve()), ReadOnly=True,
+                                     AddToRecentFiles=False, ConfirmConversions=False)
+            doc.ExportAsFixedFormat(str(pdf.resolve()), 17)
+        if not pdf.exists() or pdf.stat().st_size == 0:
+            return 0
+        rendered = fitz.open(pdf)
+        try:
+            return len(rendered)
+        finally:
+            rendered.close()
+    except Exception:
+        return 0
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except Exception:
+                pass
+        if app is not None:
+            try:
+                app.Quit()
+            except Exception:
+                pass
+        if initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
 def convert_legacy(source: Path, work_dir: Path) -> tuple[Path, list[str]]:
     ext = source.suffix.lower()
     if ext not in LEGACY_OFFICE:
@@ -442,7 +498,28 @@ def prepare_preview_cache(source: Path, cache_dir: Path, pages: int) -> None:
     remains available as a fallback.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
-    if pages < 1 or source.suffix.lower() != ".pptx":
+    if pages < 1:
+        return
+    if source.suffix.lower() == ".docx":
+        # Word startup and PDF export are expensive.  Do both once when the
+        # machine version is produced, then serve every review page as a local
+        # PNG just like a PPT deck.
+        actual_pages = document_page_count(source, cache_dir)
+        pdf = cache_dir / f"{source.stem}.pdf"
+        if actual_pages < 1 or not pdf.exists():
+            return
+        try:
+            import fitz
+            rendered = fitz.open(pdf)
+            for page in range(1, min(actual_pages, len(rendered)) + 1):
+                target = cache_dir / f"page-{page}-rendered.png"
+                if not target.exists():
+                    rendered[page - 1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False).save(target)
+            rendered.close()
+        except Exception:
+            return
+        return
+    if source.suffix.lower() != ".pptx":
         return
     if all((cache_dir / f"page-{page}-rendered.png").exists() for page in range(1, pages + 1)):
         return
@@ -515,6 +592,10 @@ def render_preview(source: Path, page_number: int, cache_dir: Path) -> Path:
     if ext in {".docx", ".xlsx"}:
         pdf=cache_dir/f"{source.stem}.pdf"
         try:
+            # A completed Word/PDF export is immutable for this version.  Do
+            # not start Office again when users simply turn to another page.
+            if pdf.exists() and pdf.stat().st_size > 0:
+                return render_preview(pdf,page_number,cache_dir)
             import pythoncom
             import win32com.client
             pythoncom.CoInitialize()
@@ -532,3 +613,62 @@ def render_preview(source: Path, page_number: int, cache_dir: Path) -> Path:
             except Exception: pass
             raise RuntimeError(f"Office 预览渲染失败：{exc}") from exc
     raise RuntimeError("该格式没有页面预览；请使用右侧结构化文本校对")
+
+
+def word_page_objects(source: Path, page_number: int, cache_dir: Path, units: list[dict]) -> dict:
+    """Locate editable Word text on a rendered page without treating images as text.
+
+    Word supplies the authoritative pagination through its cached PDF.  We map a
+    translation unit only when its current target text occurs in exactly one PDF
+    text block; ambiguous or image-only content gets no click target.
+    """
+    if source.suffix.lower() != ".docx":
+        raise ValueError("仅支持 Word 文档")
+    pdf = cache_dir / f"{source.stem}.pdf"
+    if not pdf.exists():
+        document_page_count(source, cache_dir)
+    if not pdf.exists():
+        raise RuntimeError("Word 页面定位缓存尚未准备好")
+    import fitz
+    doc = fitz.open(pdf)
+    try:
+        if page_number < 1 or page_number > len(doc):
+            raise ValueError("页码超出范围")
+        page = doc[page_number - 1]
+        blocks = page.get_text("blocks")
+        def compact(value: str) -> str:
+            return re.sub(r"[\s\u240a\u240d]+", "", value or "")
+        page_text = ""
+        indexed_blocks = []
+        for block_no, block in enumerate(blocks):
+            text = compact(block[4])
+            start = len(page_text)
+            page_text += text
+            indexed_blocks.append((block_no, block, start, len(page_text)))
+        objects = []
+        for unit in units:
+            target = compact(unit.get("human_text") or unit.get("machine_text") or "")
+            # Two-character Chinese labels such as “安全” are legitimate Word
+            # text and must remain editable.  Only ignore empty/single-glyph
+            # layout noise.
+            if len(target) < 2:
+                continue
+            start = page_text.find(target)
+            if start < 0:
+                continue
+            end = start + len(target)
+            matching = [item for item in indexed_blocks
+                        if item[3] > start and item[2] < end and item[3] > item[2]]
+            if not matching:
+                continue
+            x0 = min(item[1][0] for item in matching)
+            y0 = min(item[1][1] for item in matching)
+            x1 = max(item[1][2] for item in matching)
+            y1 = max(item[1][3] for item in matching)
+            objects.append({"id": f"word-unit:{unit['id']}", "unit_id": unit["id"],
+                            "name": (unit.get("source_text") or "Word 文本")[:80],
+                            "box": [x0 / page.rect.width, y0 / page.rect.height,
+                                    (x1 - x0) / page.rect.width, (y1 - y0) / page.rect.height]})
+        return {"width": page.rect.width, "height": page.rect.height, "objects": objects}
+    finally:
+        doc.close()

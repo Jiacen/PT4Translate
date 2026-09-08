@@ -1,4 +1,5 @@
 let reviewData=null, reviewSelection=null, reviewDirty=false, reviewSaving=false, reviewRequest=0, reviewWheelDelta=0, reviewWheelLock=false;
+let wordReviewUnits=[], wordSelectedUnitId=null;
 
 async function continueReview(){
   if(!leaveReviewEdit())return;
@@ -26,6 +27,9 @@ async function showEditablePreview(id,page){
   reviewData=null;reviewSelection=null;
   const preview=$('#preview');
   syncReviewPageNavigation();
+  if(activeFileDetail?.kind==='word'){
+    return showWordReview(id,page,ticket);
+  }
   if(activeFileDetail?.kind!=='powerpoint'){
     preview.innerHTML=`<img src="/api/files/${id}/preview/${page}" alt="文件预览"><p>此文件类型当前仅支持预览。</p>`;
     return;
@@ -52,6 +56,72 @@ async function showEditablePreview(id,page){
     $('#ppt-export').onclick=()=>{if(reviewDirty){toast('请先保存或取消当前修改',true);return}if(!reviewSaving)doPublish(id)};
     installPreviewWheelNavigation(preview);
   }catch(error){if(ticket===reviewRequest)preview.textContent=error.message}
+}
+
+async function showWordReview(id,page,ticket){
+  const preview=$('#preview');
+  preview.innerHTML=`<div class="word-review-layout" style="display:grid;grid-template-columns:minmax(360px,1.15fr) minmax(330px,.85fr);gap:18px;align-items:start"><section id="word-preview-stage">正在加载可编辑 Word 页面…</section><section id="word-review-panel" class="ppt-editor" aria-live="polite">正在加载 Word 校对单元…</section></div>`;
+  try{
+    const [data,objects]=await Promise.all([api(`/api/files/${id}/units`),api(`/api/files/${id}/pages/${page}/word-objects`)]);
+    if(ticket!==reviewRequest)return;
+    wordReviewUnits=(data.units||[]).filter(unit=>isMeaningfulWordUnit(unit));
+    wordSelectedUnitId=wordReviewUnits.some(unit=>unit.id===wordSelectedUnitId)?wordSelectedUnitId:null;
+    const imageUrl=`/api/files/${id}/preview/${page}?version_id=${encodeURIComponent(objects.version_id)}`;
+    const stage=$('#word-preview-stage');
+    stage.innerHTML=`<div class="ppt-canvas" style="aspect-ratio:${objects.width}/${objects.height}"><img id="word-preview-image" alt="Word 第 ${page} 页预览" src="${imageUrl}"><div class="ppt-hit-layer" id="word-hit-layer" hidden>${objects.objects.map(object=>`<button type="button" class="ppt-hit text" data-unit-id="${object.unit_id}" title="编辑：${esc(object.name)}" aria-label="编辑 Word 文本：${esc(object.name)}" style="left:${object.box[0]*100}%;top:${object.box[1]*100}%;width:${object.box[2]*100}%;height:${object.box[3]*100}%"></button>`).join('')}</div></div><p>点击页面中的文字块即可编辑。嵌入的幻灯片图片将在配套 PPT 校对并完成同步后更新。</p>`;
+    const image=$('#word-preview-image');
+    image.onload=()=>{$('#word-hit-layer').hidden=false};
+    if(image.complete&&image.naturalWidth)image.onload();
+    $$('#word-hit-layer .ppt-hit').forEach(button=>button.onclick=()=>{selectWordUnit(button.dataset.unitId);$('#word-review-panel').scrollIntoView({block:'nearest',behavior:'smooth'})});
+    // Bind to this page stage, which is recreated on every page change, so one
+    // wheel gesture can advance only one Word page.
+    installPreviewWheelNavigation(stage);
+    renderWordReviewPanel();
+  }catch(error){if(ticket===reviewRequest)$('#word-review-panel').textContent=`无法加载 Word 校对内容：${error.message}`}
+}
+
+function isMeaningfulWordUnit(unit){
+  const source=(unit.source_text||'').replace(/[\s\u240a\u240d]/g,'');
+  return source.length>=2&&/[A-Za-z\u4e00-\u9fff]/.test(source);
+}
+
+function wordSelectedUnit(){return wordReviewUnits.find(unit=>unit.id===wordSelectedUnitId)||null}
+
+function renderWordReviewPanel(){
+  const panel=$('#word-review-panel');if(!panel)return;
+  const selected=wordSelectedUnit();
+  if(!selected){panel.innerHTML=`<div class="ppt-editor-heading"><b>Word 文本校对</b><span>${wordReviewUnits.length} 条可编辑内容</span></div><p>请先点击左侧 Word 页面中的正文文字。这里会显示对应原文、译文和术语操作。</p>`;return}
+  panel.innerHTML=`<div class="ppt-editor-heading"><b>Word 文本校对</b><span>${esc(selected.status)}</span></div><label>原文<div class="source" style="max-height:180px;overflow:auto">${esc(selected.source_text)}</div></label><label>译文<textarea id="word-unit-text" rows="12" maxlength="20000">${esc(selected.human_text??selected.machine_text??'')}</textarea></label><div class="ppt-assist-actions"><button id="word-unit-save">保存修改</button><button id="word-unit-confirm" class="primary">确认并写入翻译记忆</button><button id="word-add-glossary">加入全局术语库</button></div><div id="word-glossary-form"></div><small>术语请填写词或短语；整段内容应保存为译文或确认到翻译记忆。</small>`;
+  $('#word-unit-save').onclick=()=>saveWordUnit(false);
+  $('#word-unit-confirm').onclick=()=>saveWordUnit(true);
+  $('#word-add-glossary').onclick=()=>openWordGlossary(selected);
+}
+
+function selectWordUnit(unitId){wordSelectedUnitId=unitId;renderWordReviewPanel()}
+
+async function saveWordUnit(confirm){
+  const selected=wordSelectedUnit(), field=$('#word-unit-text');
+  if(!selected||!field)return;
+  const text=field.value.trim();
+  if(!text)return toast('译文不能为空',true);
+  try{
+    const saved=await api(`/api/units/${selected.id}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({human_text:text,status:confirm?'confirmed':'modified',revision:selected.revision})});
+    wordReviewUnits=wordReviewUnits.map(unit=>unit.id===saved.id?saved:unit);
+    toast(confirm?'已确认并写入翻译记忆，正在更新 Word 预览':'已保存，正在更新 Word 预览');
+    renderWordReviewPanel();
+    window.setTimeout(()=>showWordReview(activeFile,activePage,++reviewRequest),800);
+  }catch(error){toast(error.message,true)}
+}
+
+function openWordGlossary(unit){
+  const form=$('#word-glossary-form');if(!form)return;
+  form.innerHTML=`<label>英文术语<input id="word-glossary-source" maxlength="300" value="${esc(unit.source_text||'')}"></label><label>中文标准译法<input id="word-glossary-target" maxlength="300" value="${esc(unit.human_text??unit.machine_text??'')}"></label><div class="ppt-assist-actions"><button id="word-glossary-save" class="primary">保存术语</button><button id="word-glossary-cancel">取消</button></div>`;
+  $('#word-glossary-cancel').onclick=()=>{form.innerHTML=''};
+  $('#word-glossary-save').onclick=async()=>{
+    const source=$('#word-glossary-source').value.trim(),target=$('#word-glossary-target').value.trim();
+    if(!source||!target)return toast('请填写英文术语和中文标准译法',true);
+    try{await api('/api/glossary',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source,target,mode:'required'})});toast('已加入全局术语库');form.innerHTML=''}catch(error){toast(error.message,true)}
+  };
 }
 
 function preloadReviewImage(src){

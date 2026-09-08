@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from sitrain_app import db, storage
+from sitrain_app import db, pipeline, storage
 from sitrain_app import main
 from sitrain_app.main import app
 from sitrain_app.terminology import residual_source_issues
@@ -17,6 +17,9 @@ from sitrain_app.terminology import residual_source_issues
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.db")
     monkeypatch.setattr(storage, "STORAGE_ROOT", tmp_path / "storage")
+    inline_translation = lambda task_id, provider_id=None: pipeline.run_translation(task_id, provider_id)
+    monkeypatch.setattr(pipeline, "schedule_translation", inline_translation)
+    monkeypatch.setattr(main, "schedule_translation", inline_translation)
     with TestClient(app) as c:
         db.execute("UPDATE providers SET protocol='mock',is_default=1,enabled=1 WHERE id='qwen-mt'")
         db.execute("UPDATE providers SET is_default=0 WHERE id<>'qwen-mt'")
@@ -37,6 +40,32 @@ def test_health_and_dual_entry_data_model(client):
     dash = client.get("/api/dashboard").json()
     modes = {f["mode"] for f in dash["files"]}
     assert modes == {"standalone","chapter"}
+
+
+def test_package_import_creates_chapters_and_pairs_by_filename(client, tmp_path):
+    from docx import Document
+    from pptx import Presentation
+
+    word = tmp_path / "SCL1_01E_Introduction.docx"
+    document = Document(); document.add_paragraph("Introduction"); document.save(word)
+    cover = tmp_path / "SCL1_00_Cover.docx"
+    document = Document(); document.add_paragraph("Cover"); document.save(cover)
+    slides = tmp_path / "SCL1_01E_Introduction.pptx"
+    Presentation().save(slides)
+    project = client.post("/api/projects", json={"name": "整套教材", "description": ""}).json()
+    with word.open("rb") as word_stream, cover.open("rb") as cover_stream, slides.open("rb") as slide_stream:
+        response = client.post(f"/api/projects/{project['id']}/package-import",
+                               files=[("word_files", (word.name, word_stream, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+                                      ("word_files", (cover.name, cover_stream, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")),
+                                      ("ppt_files", (slides.name, slide_stream, "application/vnd.openxmlformats-officedocument.presentationml.presentation"))])
+    assert response.status_code == 200, response.text
+    summary = response.json()
+    assert summary["paired_chapters"] == 1
+    assert summary["word_only"] == 1
+    detail = client.get(f"/api/projects/{project['id']}").json()
+    chapters = {chapter["name"]: chapter["files"] for chapter in detail["chapters"]}
+    assert len(chapters) == 2
+    assert sorted(file["kind"] for files in chapters.values() for file in files) == ["powerpoint", "word", "word"]
 
 
 def test_txt_upload_translate_review_publish(client):

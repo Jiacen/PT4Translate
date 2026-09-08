@@ -51,6 +51,21 @@ class _RateLimiter:
             time.sleep(delay)
 
 
+_provider_limiters: dict[tuple[str, int], _RateLimiter] = {}
+_provider_limiters_lock = threading.Lock()
+
+
+def _shared_rate_limiter(config: dict, requests_per_minute: int) -> _RateLimiter:
+    """Limit every active file together, rather than once per file."""
+    key = (str(config.get("id") or config.get("name") or config.get("base_url")), requests_per_minute)
+    with _provider_limiters_lock:
+        limiter = _provider_limiters.get(key)
+        if limiter is None:
+            limiter = _RateLimiter(requests_per_minute)
+            _provider_limiters[key] = limiter
+        return limiter
+
+
 def _post(config: dict, payload: dict) -> dict:
     key = _key(config)
     if not key:
@@ -93,7 +108,7 @@ def translate_qwen(config: dict, request: TranslationRequest, progress: Callable
     # Qwen-MT accepts one source text per request.  Parallelise only the network
     # calls, so each stable unit ID still maps to exactly one returned translation.
     concurrency = min(8, max(1, int(settings.get("concurrency", 4))))
-    limiter = _RateLimiter(max(0, int(settings.get("rpm", 0))))
+    limiter = _shared_rate_limiter(config, max(0, int(settings.get("rpm", 0))))
 
     def translate_one(key: str, text: str) -> tuple[str, str]:
         options = {"source_lang":request.source_lang,"target_lang":request.target_lang}

@@ -23,10 +23,18 @@ def serialized(fn):
 
 
 def current_version(file_id):
+    file = db.row("SELECT status FROM files WHERE id=?", (file_id,))
+    # A sync candidate is stored as an immutable published artifact, but it
+    # must not replace the active review document until the file is explicitly
+    # published.  This preserves a safe, editable machine/review version when
+    # an unverified mapping needs correction.
+    if not file or file["status"] != "published":
+        order = "CASE version_type WHEN 'review' THEN 0 WHEN 'machine' THEN 1 WHEN 'published' THEN 2 WHEN 'working' THEN 3 ELSE 4 END"
+    else:
+        order = "CASE version_type WHEN 'published' THEN 0 WHEN 'review' THEN 1 WHEN 'machine' THEN 2 WHEN 'working' THEN 3 ELSE 4 END"
     version = db.row("""SELECT * FROM file_versions WHERE file_id=?
         AND version_type IN ('review','published','machine','working','original')
-        ORDER BY CASE version_type WHEN 'review' THEN 0 WHEN 'published' THEN 1
-        WHEN 'machine' THEN 2 WHEN 'working' THEN 3 ELSE 4 END,sequence DESC LIMIT 1""", (file_id,))
+        ORDER BY """ + order + ",sequence DESC LIMIT 1", (file_id,))
     if not version:
         raise HTTPException(404, "文件版本不存在")
     return version
@@ -47,6 +55,10 @@ def preview_source(version, page):
             break
         version = parent
     root = file_dir(version["file_id"]) / "previews"
+    if Path(version["path"]).suffix.lower() == ".docx":
+        # Each Word revision has a separate PDF/page cache.  This keeps the
+        # preview faithful immediately after a text-unit edit.
+        return Path(version["path"]), root / version["id"]
     # Only the page modified by this review version needs a new render. All other
     # pages keep the completed machine-version cache, including legacy published
     # files that predate review-version lineage metadata.

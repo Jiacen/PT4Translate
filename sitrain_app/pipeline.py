@@ -3,14 +3,21 @@ from __future__ import annotations
 import json
 import shutil
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import db
-from .documents import TRANSLATE_OFFICE_IMAGE_TEXT, convert_legacy, extract_units, preflight, prepare_preview_cache, rebuild
+from .documents import (TRANSLATE_OFFICE_IMAGE_TEXT, convert_legacy, document_page_count,
+                        extract_units, preflight, prepare_preview_cache, rebuild)
 from .providers import TranslationRequest, translate
 from .storage import checksum, file_dir
 from .review_versions import serialized
 from .terminology import Term, TerminologyEngine, normalize, residual_source_issues
+
+
+# Large教材包 may contain dozens of Office files. Keep expensive API translation
+# bounded while allowing every accepted file to remain durably queued in SQLite.
+_translation_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="sitrain-translate")
 
 
 def _version(file_id: str, version_type: str) -> dict | None:
@@ -37,6 +44,10 @@ def prepare_file(file_id: str) -> None:
         else:
             working = source
         pf = preflight(working)
+        if working.suffix.lower() == ".docx":
+            pf["pages"] = document_page_count(working, file_dir(file_id) / "previews")
+            if not pf["pages"]:
+                pf["risks"].append("无法获得 Word 的实际分页；预览暂时只显示第一页")
         pf["conversion_warnings"] = warnings
         temp_dir = file_dir(file_id)/"pipeline"
         source_json, units = extract_units(working,temp_dir)
@@ -64,7 +75,12 @@ def start_automatic_translation(file_id: str) -> None:
     tid, now = db.new_id(), db.utcnow()
     db.execute("INSERT INTO tasks(id,file_id,task_type,status,idempotency_key,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
                (tid, file_id, "translate", "queued", key, now, now))
-    run_translation(tid)
+    schedule_translation(tid)
+
+
+def schedule_translation(task_id: str, provider_id: str | None = None) -> None:
+    """Submit one persisted task to the bounded local translation worker."""
+    _translation_executor.submit(run_translation, task_id, provider_id)
 
 
 @serialized
@@ -81,7 +97,12 @@ def refresh_machine_version(file_id: str) -> str | None:
                      file_dir(file_id) / "machine", file["source_language"], file["target_language"])
     version_id = add_version(file_id, "machine", output, {"generated_from": "machine_and_review"})
     try:
-        prepare_preview_cache(output, file_dir(file_id) / "previews", int((file.get("preflight") or {}).get("pages") or 0))
+        # A revised Word is a new immutable version.  Its page images must not
+        # reuse a prior version's cache, otherwise saved text appears unchanged.
+        cache = file_dir(file_id) / "previews"
+        if output.suffix.lower() == ".docx":
+            cache /= version_id
+        prepare_preview_cache(output, cache, int((file.get("preflight") or {}).get("pages") or 0))
     except Exception:
         pass
     return version_id
@@ -100,6 +121,8 @@ def _terms(project_id: str | None, source_language: str, target_language: str) -
 
 def run_translation(task_id: str, provider_id: str | None = None) -> None:
     task = db.row("SELECT * FROM tasks WHERE id=?",(task_id,))
+    if not task or task["status"] != "queued":
+        return
     file = db.row("SELECT * FROM files WHERE id=?",(task["file_id"],))
     db.execute("UPDATE tasks SET status='running',progress=0.01,updated_at=? WHERE id=?",(db.utcnow(),task_id))
     try:
