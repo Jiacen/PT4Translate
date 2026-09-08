@@ -217,6 +217,8 @@ def test_bilingual_glossary_excel_and_reverse_lookup(client):
 
     from openpyxl import load_workbook
     exported = client.get("/api/glossary/export")
+    assert exported.headers["cache-control"] == "no-store, no-cache, must-revalidate, max-age=0"
+    assert "SITRAIN-global-glossary-v2.xlsx" in exported.headers["content-disposition"]
     workbook = load_workbook(io.BytesIO(exported.content), read_only=True)
     assert tuple(next(workbook["术语表"].iter_rows(min_row=1, max_row=1, values_only=True))) == (
         "英文术语", "中文标准译法", "英文别名（逗号分隔）", "中文别名（逗号分隔，可选）",
@@ -227,3 +229,20 @@ def test_bilingual_glossary_excel_and_reverse_lookup(client):
     _records, engine = _terms(None, "Chinese", "English")
     protected, mapping = engine.protect("变量标签")
     assert engine.restore(protected, mapping) == "TAG"
+
+
+def test_global_glossary_can_be_edited_and_deleted(client):
+    created = client.post("/api/glossary", json={
+        "source": "HMI", "target": "人机界面", "aliases": ["hmi"], "chinese_aliases": ["操作屏"],
+    })
+    assert created.status_code == 200
+    term_id = created.json()["id"]
+    updated = client.put(f"/api/glossary/{term_id}", json={
+        "source": "HMI", "target": "人机接口", "aliases": ["hmi", "Human Machine Interface"],
+        "chinese_aliases": ["操作屏"], "mode": "required",
+    })
+    assert updated.status_code == 200
+    assert updated.json()["target"] == "人机接口"
+    assert updated.json()["aliases"] == ["hmi", "Human Machine Interface"]
+    assert client.delete(f"/api/glossary/{term_id}").status_code == 200
+    assert all(item["id"] != term_id for item in client.get("/api/glossary").json()["terms"])

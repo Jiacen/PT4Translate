@@ -19,18 +19,20 @@ def main(source_arg: str, target_arg: str, page_arg: str) -> int:
         pythoncom.CoInitialize()
         initialized = True
         app = win32com.client.DispatchEx("PowerPoint.Application")
-        presentation = app.Presentations.Open(str(source.resolve()), WithWindow=False)
+        app.AutomationSecurity = 3  # Never run macros from a document being previewed.
+        presentation = app.Presentations.Open(str(source.resolve()), ReadOnly=True, WithWindow=False)
+        height = round(1600 * presentation.PageSetup.SlideHeight / presentation.PageSetup.SlideWidth)
         if page_arg == "all":
             target.mkdir(parents=True, exist_ok=True)
             for page in range(1, presentation.Slides.Count + 1):
                 image = target / f"page-{page}-rendered.png"
-                presentation.Slides.Item(page).Export(str(image.resolve()), "PNG", 1600, 900)
+                presentation.Slides.Item(page).Export(str(image.resolve()), "PNG", 1600, height)
             return 0
         page = int(page_arg)
         if page < 1 or page > presentation.Slides.Count:
             return 2
         target.parent.mkdir(parents=True, exist_ok=True)
-        presentation.Slides.Item(page).Export(str(target.resolve()), "PNG", 1600, 900)
+        presentation.Slides.Item(page).Export(str(target.resolve()), "PNG", 1600, height)
         return 0 if target.exists() and target.stat().st_size else 1
     except Exception:
         return 1

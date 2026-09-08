@@ -97,6 +97,12 @@ CREATE TABLE IF NOT EXISTS translation_memory (
   source_norm TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL,
   origin_unit_id TEXT, approved_at TEXT NOT NULL, UNIQUE(project_id, source_norm)
 );
+CREATE TABLE IF NOT EXISTS review_changes (
+  id TEXT PRIMARY KEY, file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  page INTEGER NOT NULL, object_id TEXT NOT NULL, unit_id TEXT REFERENCES translation_units(id) ON DELETE SET NULL,
+  source_text TEXT NOT NULL, before_text TEXT NOT NULL, after_text TEXT NOT NULL,
+  change_type TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS ppt_word_mappings (
   id TEXT PRIMARY KEY, chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
   ppt_file_id TEXT NOT NULL REFERENCES files(id), word_file_id TEXT NOT NULL REFERENCES files(id),
@@ -107,6 +113,7 @@ CREATE TABLE IF NOT EXISTS ppt_word_mappings (
 CREATE INDEX IF NOT EXISTS idx_files_chapter ON files(chapter_id);
 CREATE INDEX IF NOT EXISTS idx_units_file_status ON translation_units(file_id,status);
 CREATE INDEX IF NOT EXISTS idx_versions_file ON file_versions(file_id,version_type,sequence);
+CREATE INDEX IF NOT EXISTS idx_review_changes_file ON review_changes(file_id,created_at);
 """
 
 

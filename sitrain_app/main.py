@@ -15,6 +15,9 @@ from pydantic import BaseModel, Field
 from . import __version__, db
 from .config import ROOT, ensure_data_dirs
 from .documents import render_preview
+from .ppt_review import page_objects
+from .review_versions import (apply_same_source, current_version, preview_source, reopen_review,
+                              review_context, save_edit, save_review_memory, serialized)
 from .glossary_excel import export_global_terms, parse_global_terms
 from .pipeline import add_version, prepare_file, publish, refresh_machine_version, run_translation, start_automatic_translation
 from .providers import ProviderError, TranslationRequest, translate
@@ -42,6 +45,14 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="SITRAIN 教材智能翻译与校对平台",version=__version__,lifespan=lifespan)
 
 
+@app.middleware('http')
+async def revalidate_frontend(request, call_next):
+    response = await call_next(request)
+    if request.url.path == '/' or request.url.path.endswith(('.html', '.js', '.css')):
+        response.headers['Cache-Control'] = 'no-cache, must-revalidate'
+    return response
+
+
 class ProjectIn(BaseModel):
     name: str = Field(min_length=1,max_length=120)
     description: str = Field(default="",max_length=1000)
@@ -55,6 +66,17 @@ class UnitPatch(BaseModel):
     human_text: str | None = None
     status: str | None = None
     revision: int
+
+
+class PptTextPatch(BaseModel):
+    base_version: str
+    object_id: str = Field(max_length=80)
+    paragraphs: list[str] = Field(max_length=200)
+
+
+class ReviewObjectAction(BaseModel):
+    base_version: str
+    object_id: str = Field(max_length=80)
 
 
 class ProviderIn(BaseModel):
@@ -177,19 +199,72 @@ def units(file_id: str,status: str|None=None):
 
 
 @app.get("/api/files/{file_id}/preview/{page_number}")
-def file_preview(file_id: str,page_number: int):
+def file_preview(file_id: str,page_number: int,version_id: str|None=None):
     file=db.row("SELECT * FROM files WHERE id=?",(file_id,))
     if not file: raise HTTPException(404,"文件不存在")
-    version=db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type IN ('published','machine','working','original') ORDER BY CASE version_type WHEN 'published' THEN 1 WHEN 'machine' THEN 2 WHEN 'working' THEN 3 ELSE 4 END,sequence DESC LIMIT 1",(file_id,))
-    try: path=render_preview(Path(version["path"]),page_number,file_dir(file_id)/"previews")
+    if page_number < 1 or page_number > max(1, int((file.get('preflight') or {}).get('pages') or 1)):
+        raise HTTPException(404, "页码超出范围")
+    version=db.row("SELECT * FROM file_versions WHERE id=? AND file_id=?", (version_id,file_id)) if version_id else current_version(file_id)
+    if not version: raise HTTPException(404, "文件版本不存在")
+    source,cache=preview_source(version,page_number)
+    try: path=render_preview(source,page_number,cache)
     except RuntimeError as exc: raise HTTPException(409,str(exc)) from exc
     return FileResponse(path,media_type="image/png")
 
 
+@app.get("/api/files/{file_id}/pages/{page_number}/objects")
+def ppt_objects(file_id: str, page_number: int):
+    version = current_version(file_id)
+    source = Path(version["path"])
+    if source.suffix.lower() != '.pptx':
+        raise HTTPException(415, "当前原位编辑仅支持 PowerPoint 文件")
+    try:
+        result = page_objects(str(source), source.stat().st_mtime_ns, page_number)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {**result, "version_id": version["id"]}
+
+
+@app.get("/api/files/{file_id}/pages/{page_number}/review-context")
+def ppt_review_context(file_id: str, page_number: int, object_id: str):
+    return review_context(file_id, page_number, object_id)
+
+
+@app.post("/api/files/{file_id}/reopen-review")
+def file_reopen_review(file_id: str):
+    return reopen_review(file_id)
+
+
+@app.patch("/api/files/{file_id}/pages/{page_number}/text")
+def ppt_text(file_id: str, page_number: int, body: PptTextPatch):
+    return save_edit(file_id, page_number, body.object_id, body.base_version, paragraphs=body.paragraphs)
+
+
+@app.post("/api/files/{file_id}/pages/{page_number}/image")
+def ppt_image(file_id: str, page_number: int, base_version: str=Form(...), object_id: str=Form(...), upload: UploadFile=File(...)):
+    content = upload.file.read(10*1024*1024+1)
+    if len(content) > 10*1024*1024:
+        raise HTTPException(413, "图片不能超过 10 MB")
+    return save_edit(file_id, page_number, object_id, base_version, image=content)
+
+
+@app.post("/api/files/{file_id}/pages/{page_number}/apply-same-source")
+def ppt_apply_same_source(file_id: str, page_number: int, body: ReviewObjectAction):
+    return apply_same_source(file_id, page_number, body.object_id, body.base_version)
+
+
+@app.post("/api/files/{file_id}/pages/{page_number}/translation-memory")
+def ppt_save_review_memory(file_id: str, page_number: int, body: ReviewObjectAction):
+    return save_review_memory(file_id, page_number, body.object_id, body.base_version)
+
+
 @app.patch("/api/units/{unit_id}")
+@serialized
 def unit_patch(unit_id: str,body: UnitPatch,background: BackgroundTasks):
     current=db.row("SELECT * FROM translation_units WHERE id=?",(unit_id,))
     if not current: raise HTTPException(404,"翻译单元不存在")
+    if db.row("SELECT id FROM file_versions WHERE file_id=? AND version_type='review'", (current['file_id'],)):
+        raise HTTPException(409, "请在页面内编辑，避免覆盖已有的原位校对修改")
     if current["revision"]!=body.revision: raise HTTPException(409,"该译文已被其他修改更新，请刷新后重试")
     text=body.human_text if body.human_text is not None else current.get("human_text")
     status=body.status or ("modified" if body.human_text is not None else current["status"])
@@ -203,9 +278,12 @@ def unit_patch(unit_id: str,body: UnitPatch,background: BackgroundTasks):
 
 
 @app.post("/api/files/{file_id}/translate")
+@serialized
 def translate_start(file_id: str,background: BackgroundTasks,provider_id: str|None=None):
     file=db.row("SELECT * FROM files WHERE id=?",(file_id,))
     if not file or file["status"] not in {"ready","review","failed"}: raise HTTPException(409,"文件尚未完成预检或当前状态不可翻译")
+    if db.row("SELECT id FROM file_versions WHERE file_id=? AND version_type='review'", (file_id,)):
+        raise HTTPException(409, "此文件已有人工校对版本；如需重新翻译，请另行上传原件")
     key=f"translate:{file_id}:{db.scalar('SELECT COALESCE(MAX(revision),0) FROM translation_units WHERE file_id=?',(file_id,))}:{provider_id or 'default'}"
     existing=db.row("SELECT * FROM tasks WHERE idempotency_key=?",(key,))
     if existing and existing["status"] in {"queued","running","completed"}: return existing
@@ -302,12 +380,42 @@ def glossary_add(body: TermIn):
     return db.row("SELECT * FROM glossary_terms WHERE id=?",(tid,))
 
 
+@app.put("/api/glossary/{term_id}")
+def glossary_update(term_id: str, body: TermIn):
+    current = db.row("SELECT * FROM glossary_terms WHERE id=?", (term_id,))
+    if not current:
+        raise HTTPException(404, "术语不存在")
+    siblings = db.rows("SELECT id,source FROM glossary_terms WHERE project_id IS ? AND id<>?",
+                       (current.get("project_id"), term_id))
+    if any(normalize(item["source"]) == normalize(body.source) for item in siblings):
+        raise HTTPException(409, "同一术语库中已存在相同英文术语")
+    db.execute("UPDATE glossary_terms SET source=?,target=?,aliases_json=?,chinese_aliases_json=?,mode=?,case_sensitive=?,updated_at=? WHERE id=?",
+               (body.source, body.target, json.dumps(body.aliases, ensure_ascii=False),
+                json.dumps(body.chinese_aliases, ensure_ascii=False), body.mode,
+                int(body.case_sensitive), db.utcnow(), term_id))
+    return db.row("SELECT * FROM glossary_terms WHERE id=?", (term_id,))
+
+
+@app.delete("/api/glossary/{term_id}")
+def glossary_delete(term_id: str):
+    if not db.row("SELECT id FROM glossary_terms WHERE id=?", (term_id,)):
+        raise HTTPException(404, "术语不存在")
+    db.execute("DELETE FROM glossary_terms WHERE id=?", (term_id,))
+    return {"ok": True}
+
+
 @app.get("/api/glossary/export")
 def glossary_export():
     terms = db.rows("SELECT * FROM glossary_terms WHERE project_id IS NULL ORDER BY LENGTH(source) DESC")
     return StreamingResponse(iter([export_global_terms(terms)]),
                              media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                             headers={"Content-Disposition": "attachment; filename=SITRAIN-global-glossary.xlsx"})
+                             headers={
+                                 "Content-Disposition": "attachment; filename=SITRAIN-global-glossary-v2.xlsx",
+                                 # A downloaded glossary must never be served from an earlier UI schema.
+                                 "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                                 "Pragma": "no-cache",
+                                 "Expires": "0",
+                             })
 
 
 @app.post("/api/glossary/import")

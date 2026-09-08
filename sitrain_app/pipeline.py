@@ -9,6 +9,7 @@ from . import db
 from .documents import TRANSLATE_OFFICE_IMAGE_TEXT, convert_legacy, extract_units, preflight, prepare_preview_cache, rebuild
 from .providers import TranslationRequest, translate
 from .storage import checksum, file_dir
+from .review_versions import serialized
 from .terminology import Term, TerminologyEngine, normalize, residual_source_issues
 
 
@@ -66,7 +67,10 @@ def start_automatic_translation(file_id: str) -> None:
     run_translation(tid)
 
 
+@serialized
 def refresh_machine_version(file_id: str) -> str | None:
+    if _version(file_id, "review"):
+        raise RuntimeError("已有原位校对版本，不能用重新翻译覆盖人工修改")
     file = db.row("SELECT * FROM files WHERE id=?", (file_id,))
     if not file or file["status"] not in {"review", "published"}:
         return None
@@ -142,6 +146,7 @@ def run_translation(task_id: str, provider_id: str | None = None) -> None:
         db.execute("UPDATE files SET status='failed',error=?,updated_at=? WHERE id=?",(str(exc),db.utcnow(),file["id"]))
 
 
+@serialized
 def publish(file_id: str) -> str:
     file = db.row("SELECT * FROM files WHERE id=?",(file_id,))
     source_v = _version(file_id,"working") or _version(file_id,"original")
@@ -150,8 +155,15 @@ def publish(file_id: str) -> str:
     blockers = [q for u in units for q in (u.get("qa") or []) if q.get("severity")=="blocker" and u["status"]!="confirmed"]
     if blockers:
         raise RuntimeError(f"仍有 {len(blockers)} 个阻止发布的 QA 问题")
-    source_json_path = (file.get("preflight") or {}).get("source_json")
-    result = rebuild(source,Path(source_json_path) if source_json_path else None,units,file_dir(file_id)/"published",file["source_language"],file["target_language"])
-    vid = add_version(file_id,"published",result,{"qa_blockers":0})
+    reviewed = _version(file_id, "review")
+    destination = file_dir(file_id)/"published"/db.new_id()
+    if reviewed:
+        destination.mkdir(parents=True, exist_ok=True)
+        result = destination/Path(reviewed["path"]).name
+        shutil.copyfile(reviewed["path"], result)
+    else:
+        source_json_path = (file.get("preflight") or {}).get("source_json")
+        result = rebuild(source,Path(source_json_path) if source_json_path else None,units,destination,file["source_language"],file["target_language"])
+    vid = add_version(file_id,"published",result,{"qa_blockers":0, **({"base_version":reviewed["id"]} if reviewed else {})})
     db.execute("UPDATE files SET status='published',updated_at=? WHERE id=?",(db.utcnow(),file_id))
     return vid
