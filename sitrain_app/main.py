@@ -23,9 +23,9 @@ from .ppt_review import page_objects
 from .review_versions import (apply_same_source, current_version, preview_source, reopen_review,
                               review_context, save_edit, save_review_memory, serialized)
 from .glossary_excel import export_global_terms, parse_global_terms
-from .pipeline import (add_version, prepare_file, publish, refresh_machine_version,
-                       revalidate_terminology_qa, run_translation, schedule_translation,
-                       start_automatic_translation)
+from .pipeline import (add_version, auto_repair_missing_terms, confirm_manual_term_exceptions, prepare_file, publish, refresh_machine_version,
+                       revalidate_terminology_qa, run_translation, schedule_project_translation,
+                       schedule_translation, start_automatic_translation, start_project_translation)
 from .providers import ProviderError, TranslationRequest, translate
 from .storage import checksum, file_dir, save_upload
 from .sync import _latest, apply_sync, create_mappings
@@ -39,12 +39,19 @@ TARGET_LANGUAGES = {"Chinese", "English"}
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_data_dirs(); db.init_db()
-    for task in db.rows("SELECT id FROM tasks WHERE status='queued' AND task_type='translate'"):
+    for task in db.rows("""SELECT t.id FROM tasks t LEFT JOIN files f ON f.id=t.file_id
+                         WHERE t.status='queued' AND t.task_type='translate' AND f.project_id IS NULL"""):
         schedule_translation(task["id"])
     for file in db.rows("SELECT id FROM files WHERE status='preflight'"):
         threading.Thread(target=prepare_file,args=(file["id"],),daemon=True).start()
-    for file in db.rows("SELECT id FROM files WHERE status='ready'"):
+    for file in db.rows("SELECT id FROM files WHERE status='ready' AND project_id IS NULL"):
         threading.Thread(target=start_automatic_translation,args=(file["id"],),daemon=True).start()
+    for project in db.rows("SELECT id FROM projects WHERE workflow_status='translating'"):
+        # Queued tasks are the one already-released chapter; submit those first.
+        for task in db.rows("""SELECT t.id FROM tasks t JOIN files f ON f.id=t.file_id
+                             WHERE f.project_id=? AND t.status='queued' AND t.task_type='translate'""", (project["id"],)):
+            schedule_translation(task["id"])
+        schedule_project_translation(project["id"])
     yield
 
 
@@ -66,6 +73,16 @@ class ProjectIn(BaseModel):
 
 class ChapterIn(BaseModel):
     name: str = Field(min_length=1,max_length=120)
+
+
+class StructureChapterIn(BaseModel):
+    id: str | None = None
+    name: str = Field(min_length=1, max_length=120)
+    file_ids: list[str] = Field(default_factory=list)
+
+
+class ProjectStructureIn(BaseModel):
+    chapters: list[StructureChapterIn] = Field(min_length=1, max_length=200)
 
 
 class UnitPatch(BaseModel):
@@ -133,6 +150,53 @@ def _file_kind(extension: str) -> str:
     return {".pptx":"powerpoint", ".ppt":"powerpoint", ".docx":"word", ".doc":"word", ".xlsx":"excel", ".xls":"excel", ".pdf":"pdf"}.get(extension, "text")
 
 
+def _chapter_sync_gate(chapter_id: str, files: list[dict]) -> dict | None:
+    """Return the teacher action that must precede delivery for a Word+PPT pair."""
+    word = next((file for file in files if file["kind"] == "word"), None)
+    ppt = next((file for file in files if file["kind"] == "powerpoint"), None)
+    if not word or not ppt or word["status"] != "published" or ppt["status"] != "published":
+        return None
+    sync = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1",
+                  (word["id"],))
+    if not sync:
+        return {"code": "mapping", "label": "请确认图文对应", "action": "请确认 Word 图片与 PPT 页的对应关系。"}
+    if not (sync.get("metadata") or {}).get("sync_review_confirmed"):
+        return {"code": "sync_review", "label": "请校验同步结果", "action": "请检查 PPT 图片更新后的 Word 页面。"}
+    return None
+
+
+def _project_teacher_status(project: dict) -> dict:
+    """Return only the state and next action useful to a teacher.
+
+    Internal extraction, OCR and worker phases deliberately stay out of this
+    contract; troubleshooting remains available through per-file errors.
+    """
+    files = db.rows("SELECT * FROM files WHERE project_id=?", (project["id"],))
+    if any(file["status"] == "preflight" for file in files):
+        return {"code": "organizing", "label": "正在整理文件", "action": "请稍候，系统正在整理教材文件。"}
+    if project.get("workflow_status") == "structure_review":
+        return {"code": "confirm_structure", "label": "请确认结构", "action": "请检查章节顺序、配对和文件归属。"}
+    if project.get("workflow_status") == "waiting_start":
+        return {"code": "waiting_start", "label": "等待开始", "action": "结构已确认，等待您开始翻译。"}
+    if any(file["status"] == "failed" for file in files):
+        return {"code": "needs_attention", "label": "需要处理", "action": "有章节需要重试或跳过；其他章节会继续准备。"}
+    for chapter in db.rows("SELECT id FROM chapters WHERE project_id=? ORDER BY position,created_at", (project["id"],)):
+        gate = _chapter_sync_gate(chapter["id"], [file for file in files if file.get("chapter_id") == chapter["id"]])
+        if gate:
+            return gate
+    running = db.row("""SELECT c.position,c.name FROM tasks t JOIN files f ON f.id=t.file_id
+                     JOIN chapters c ON c.id=f.chapter_id
+                     WHERE f.project_id=? AND t.status IN ('queued','running')
+                     ORDER BY c.position LIMIT 1""", (project["id"],))
+    if running:
+        return {"code": "translating", "label": "翻译中", "action": f"正在翻译第 {int(running['position']) + 1} 章：{running['name']}。"}
+    if any(file["status"] == "review" for file in files):
+        return {"code": "review", "label": "请校对", "action": "已有章节初稿准备就绪，请进入校对。"}
+    if files and all(file["status"] == "published" for file in files):
+        return {"code": "download", "label": "可下载", "action": "全部章节均已完成，可下载项目交付包。"}
+    return {"code": "waiting_start", "label": "等待开始", "action": "结构已确认，等待开始翻译。"}
+
+
 @app.get("/api/health")
 def health():
     active = db.row("SELECT name,model,api_key,last_test_status FROM providers WHERE enabled=1 AND is_default=1 LIMIT 1")
@@ -169,6 +233,7 @@ def project_create(body: ProjectIn):
 def project_get(project_id: str):
     project = db.row("SELECT * FROM projects WHERE id=?",(project_id,))
     if not project: raise HTTPException(404,"教材项目不存在")
+    project["teacher_status"] = _project_teacher_status(project)
     project["chapters"] = db.rows("SELECT * FROM chapters WHERE project_id=? ORDER BY position,created_at",(project_id,))
     for chapter in project["chapters"]:
         chapter["files"] = db.rows("SELECT * FROM files WHERE chapter_id=? ORDER BY created_at",(chapter["id"],))
@@ -176,6 +241,21 @@ def project_get(project_id: str):
             review = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (file["id"],))
             if review:
                 file["sync_review"] = {"id": review["id"], **(review.get("metadata") or {})}
+        statuses = [file["status"] for file in chapter["files"]]
+        active_count = db.scalar("""SELECT COUNT(*) FROM tasks t JOIN files f ON f.id=t.file_id
+                                  WHERE f.chapter_id=? AND t.status IN ('queued','running')""", (chapter["id"],))
+        if any(status == "preflight" for status in statuses):
+            chapter["teacher_status"] = {"code":"organizing", "label":"正在整理文件", "action":"请稍候"}
+        elif any(status == "failed" for status in statuses):
+            chapter["teacher_status"] = {"code":"needs_attention", "label":"需要处理", "action":"请查看原因后重试或跳过"}
+        elif active_count:
+            chapter["teacher_status"] = {"code":"translating", "label":"翻译中", "action":"系统正在生成初稿"}
+        elif statuses and all(status == "published" for status in statuses):
+            chapter["teacher_status"] = _chapter_sync_gate(chapter["id"], chapter["files"]) or {"code":"download", "label":"可下载", "action":"本章已完成"}
+        elif any(status == "review" for status in statuses):
+            chapter["teacher_status"] = {"code":"review", "label":"请校对", "action":"本章初稿已就绪"}
+        else:
+            chapter["teacher_status"] = {"code":"waiting_start", "label":"等待开始", "action":"等待前一章完成翻译"}
     return project
 
 
@@ -185,6 +265,49 @@ def chapter_create(project_id: str,body: ChapterIn):
     cid,now = db.new_id(),db.utcnow(); pos=db.scalar("SELECT COALESCE(MAX(position),-1)+1 FROM chapters WHERE project_id=?",(project_id,))
     db.execute("INSERT INTO chapters(id,project_id,name,position,created_at,updated_at) VALUES(?,?,?,?,?,?)",(cid,project_id,body.name,pos,now,now))
     return db.row("SELECT * FROM chapters WHERE id=?",(cid,))
+
+
+@app.put("/api/projects/{project_id}/structure")
+@serialized
+def project_structure_update(project_id: str, body: ProjectStructureIn):
+    project = db.row("SELECT * FROM projects WHERE id=?", (project_id,))
+    if not project:
+        raise HTTPException(404, "教材项目不存在")
+    if project.get("workflow_status") == "translating":
+        raise HTTPException(409, "项目已经开始翻译；请先完成当前翻译章节后再调整后续结构")
+    files = db.rows("SELECT id FROM files WHERE project_id=?", (project_id,))
+    valid_ids = {file["id"] for file in files}
+    assigned = [file_id for chapter in body.chapters for file_id in chapter.file_ids]
+    if len(assigned) != len(set(assigned)) or set(assigned) != valid_ids:
+        raise HTTPException(422, "每个已上传文件必须且只能归入一个章节")
+    existing = {chapter["id"]: chapter for chapter in db.rows("SELECT * FROM chapters WHERE project_id=?", (project_id,))}
+    requested_ids = {chapter.id for chapter in body.chapters if chapter.id}
+    if not requested_ids.issubset(existing):
+        raise HTTPException(422, "章节不属于当前项目")
+    now = db.utcnow()
+    with db.connect() as conn:
+        for position, chapter in enumerate(body.chapters):
+            chapter_id = chapter.id or db.new_id()
+            if chapter.id:
+                conn.execute("UPDATE chapters SET name=?,position=?,updated_at=? WHERE id=?", (chapter.name, position, now, chapter_id))
+            else:
+                conn.execute("INSERT INTO chapters(id,project_id,name,position,created_at,updated_at) VALUES(?,?,?,?,?,?)", (chapter_id, project_id, chapter.name, position, now, now))
+            conn.executemany("UPDATE files SET chapter_id=?,mode='chapter',updated_at=? WHERE id=?", [(chapter_id, now, file_id) for file_id in chapter.file_ids])
+        for chapter_id in set(existing) - requested_ids:
+            conn.execute("DELETE FROM chapters WHERE id=?", (chapter_id,))
+        conn.execute("UPDATE projects SET workflow_status='waiting_start',updated_at=? WHERE id=?", (now, project_id))
+    # Commit the structure snapshot before re-reading it through a separate
+    # SQLite connection for the API response.
+    return project_get(project_id)
+
+
+@app.post("/api/projects/{project_id}/translate")
+def project_translate_start(project_id: str):
+    try:
+        start_project_translation(project_id)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return project_get(project_id)
 
 
 @app.post("/api/files/upload")
@@ -202,6 +325,8 @@ async def upload(background: BackgroundTasks,upload: UploadFile=File(...),projec
     db.execute("INSERT INTO files(id,project_id,chapter_id,original_name,extension,kind,mode,status,source_language,target_language,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                (fid,project_id,chapter_id,path.name,ext,kind,"chapter" if chapter_id else "standalone","preflight",source_language,target_language,now,now))
     add_version(fid,"original",path,{"immutable":True})
+    if project_id:
+        db.execute("UPDATE projects SET workflow_status='structure_review',updated_at=? WHERE id=?", (db.utcnow(), project_id))
     background.add_task(prepare_file,fid)
     return {"id":fid,"status":"preflight","name":path.name}
 
@@ -219,6 +344,7 @@ async def package_import(project_id: str, background: BackgroundTasks,
         raise HTTPException(422, "语言设置无效")
     if source_language != "auto" and source_language == target_language:
         raise HTTPException(422, "源语言与目标语言不能相同")
+    db.execute("UPDATE projects SET workflow_status='structure_review',updated_at=? WHERE id=?", (db.utcnow(), project_id))
     incoming = [("word", upload) for upload in word_files] + [("ppt", upload) for upload in ppt_files]
     keys: dict[str, dict[str, list[UploadFile]]] = {}
     for family, upload in incoming:
@@ -378,6 +504,8 @@ def unit_patch(unit_id: str,body: UnitPatch,background: BackgroundTasks):
 def translate_start(file_id: str,background: BackgroundTasks,provider_id: str|None=None):
     file=db.row("SELECT * FROM files WHERE id=?",(file_id,))
     if not file or file["status"] not in {"ready","review","failed"}: raise HTTPException(409,"文件尚未完成预检或当前状态不可翻译")
+    if file.get("project_id"):
+        raise HTTPException(409, "教材项目请先确认结构，再使用“开始翻译项目”按章节执行")
     if db.row("SELECT id FROM file_versions WHERE file_id=? AND version_type='review'", (file_id,)):
         raise HTTPException(409, "此文件已有人工校对版本；如需重新翻译，请另行上传原件")
     key=f"translate:{file_id}:{db.scalar('SELECT COALESCE(MAX(revision),0) FROM translation_units WHERE file_id=?',(file_id,))}:{provider_id or 'default'}"
@@ -407,6 +535,22 @@ def file_qa_blockers(file_id: str):
                                  "source_text": unit["source_text"], "target_text": unit.get("human_text") or unit.get("machine_text") or "",
                                  "code": issue.get("code"), "message": issue.get("message", "需要校对")})
     return {"blockers": blockers}
+
+
+@app.post("/api/files/{file_id}/repair-terms")
+def file_repair_terms(file_id: str):
+    try:
+        return auto_repair_missing_terms(file_id)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/files/{file_id}/confirm-manual-term-exceptions")
+def file_confirm_manual_term_exceptions(file_id: str):
+    try:
+        return confirm_manual_term_exceptions(file_id)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/versions/{version_id}/download")
@@ -585,6 +729,11 @@ def sync_review_confirm(file_id: str):
 
 def _chapter_delivery_versions(chapter_id: str) -> list[dict]:
     files = db.rows("SELECT * FROM files WHERE chapter_id=?", (chapter_id,))
+    gate = _chapter_sync_gate(chapter_id, files)
+    if gate and gate["code"] == "mapping":
+        raise HTTPException(409, "本章尚未确认 Word 图片与 PPT 页的对应关系；请先点击“确认图文对应”")
+    if gate and gate["code"] == "sync_review":
+        raise HTTPException(409, "本章同步后的 Word 尚未校验；请先完成“确认同步后 Word 交付”")
     versions = []
     for file in files:
         sync = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (file["id"],))

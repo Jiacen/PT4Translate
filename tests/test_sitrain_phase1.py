@@ -68,6 +68,39 @@ def test_package_import_creates_chapters_and_pairs_by_filename(client, tmp_path)
     assert sorted(file["kind"] for files in chapters.values() for file in files) == ["powerpoint", "word", "word"]
 
 
+def test_project_requires_structure_confirmation_and_releases_one_chapter(client, monkeypatch):
+    project = client.post("/api/projects", json={"name": "章节队列", "description": ""}).json()
+    first = client.post(f"/api/projects/{project['id']}/chapters", json={"name": "第一章"}).json()
+    second = client.post(f"/api/projects/{project['id']}/chapters", json={"name": "第二章"}).json()
+    first_file = client.post("/api/files/upload", data={"project_id": project["id"], "chapter_id": first["id"]},
+                             files={"upload": ("one.txt", b"First chapter", "text/plain")}).json()["id"]
+    second_file = client.post("/api/files/upload", data={"project_id": project["id"], "chapter_id": second["id"]},
+                              files={"upload": ("two.txt", b"Second chapter", "text/plain")}).json()["id"]
+    second_companion = client.post("/api/files/upload", data={"project_id": project["id"], "chapter_id": second["id"]},
+                                   files={"upload": ("two-notes.txt", b"Second chapter notes", "text/plain")}).json()["id"]
+    detail = client.get(f"/api/projects/{project['id']}").json()
+    assert detail["teacher_status"]["code"] == "confirm_structure"
+    assert client.get(f"/api/files/{first_file}").json()["status"] == "ready"
+    assert client.post(f"/api/files/{first_file}/translate").status_code == 409
+
+    reordered = client.put(f"/api/projects/{project['id']}/structure", json={"chapters": [
+        {"id": second["id"], "name": "第二章（优先）", "file_ids": [second_file, second_companion]},
+        {"id": first["id"], "name": "第一章", "file_ids": [first_file]},
+    ]})
+    assert reordered.status_code == 200
+    assert reordered.json()["teacher_status"]["code"] == "waiting_start"
+
+    submitted = []
+    monkeypatch.setattr(pipeline, "schedule_translation", lambda task_id, provider_id=None: submitted.append(task_id))
+    started = client.post(f"/api/projects/{project['id']}/translate")
+    assert started.status_code == 200
+    assert started.json()["teacher_status"]["code"] == "translating"
+    assert len(submitted) == 2
+    task_files = {db.row("SELECT file_id FROM tasks WHERE id=?", (task_id,))["file_id"] for task_id in submitted}
+    assert task_files == {second_file, second_companion}
+    assert not db.row("SELECT id FROM tasks WHERE file_id=?", (first_file,))
+
+
 def test_txt_upload_translate_review_publish(client):
     uploaded = client.post("/api/files/upload", files={"upload":("manual.txt",b"Start the motor 24 V\nStop the motor\n","text/plain")}).json()
     fid = uploaded["id"]
@@ -218,6 +251,35 @@ def test_short_uppercase_glossary_term_does_not_match_lowercase_word():
     assert not engine.validate("Click to continue", "单击以继续")
 
 
+def test_missing_required_term_is_safely_retranslated_not_blindly_appended(monkeypatch):
+    term = Term("unified", "Unified", "Unified")
+    engine = TerminologyEngine([term])
+    unit = {"stable_key": "1", "source_text": "Unified Basic Panel", "unit_type": "text"}
+    file = {"source_language": "English", "target_language": "Chinese"}
+
+    def protected_echo(_provider, request, _progress):
+        # A provider returning the protected placeholder lets the engine restore
+        # the required product term in its original sentence position.
+        return {key: text for key, text in request.units}
+
+    monkeypatch.setattr(pipeline, "translate", protected_echo)
+    fixed, repaired = pipeline._retry_missing_terms(
+        {"id": "mock"}, file, engine, [{"source": "Unified", "target": "Unified"}], [], [unit], {"1": "统一基础面板"}
+    )
+    assert repaired == 1
+    assert fixed["1"] == "Unified Basic Panel"
+    assert not engine.validate(unit["source_text"], fixed["1"])
+
+
+def test_specific_glossary_term_suppresses_nested_generic_term_blocker():
+    engine = TerminologyEngine([
+        Term("comfort", "Comfort", "Comfort"),
+        Term("comfort-panel", "Comfort Panel", "精智面板"),
+    ])
+    assert not engine.validate("Choose a Comfort Panel.", "请选择精智面板。")
+    assert [issue for issue in engine.validate("Choose Comfort.", "请选择精智。") if issue["code"] == "TERM_MISSING"]
+
+
 def test_ppt_alttext_qa_warns_but_does_not_block_release():
     from sitrain_app.pipeline import _qa_issues
     engine = TerminologyEngine([])
@@ -245,6 +307,22 @@ def test_glossary_change_rechecks_unconfirmed_qa_without_overwriting_text(client
     assert refreshed["human_text"] == "人工译文保持不变"
     assert refreshed["status"] == "pending_review"
     assert not [issue for issue in refreshed["qa"] if issue["code"] == "TERM_MISSING"]
+
+
+def test_teacher_can_record_a_manual_term_exception_only_after_machine_blockers_are_gone(client):
+    uploaded = client.post("/api/files/upload", files={"upload": ("manual-term.txt", b"Comfort\n", "text/plain")}).json()
+    unit = client.get(f"/api/files/{uploaded['id']}/units").json()["units"][0]
+    db.execute("UPDATE translation_units SET human_text=?,status='modified',qa_json=? WHERE id=?",
+               ("精智面板", json.dumps([{"code": "TERM_MISSING", "severity": "blocker", "message": "必须使用术语"}]), unit["id"]))
+    accepted = client.post(f"/api/files/{uploaded['id']}/confirm-manual-term-exceptions")
+    assert accepted.status_code == 200 and accepted.json()["confirmed"] == 1
+    refreshed = client.get(f"/api/files/{uploaded['id']}/units").json()["units"][0]
+    assert refreshed["status"] == "confirmed"
+    assert refreshed["qa"][0]["code"] == "TERM_EXCEPTION_CONFIRMED"
+    db.execute("UPDATE translation_units SET human_text=NULL,status='terminology_issue',qa_json=? WHERE id=?",
+               (json.dumps([{"code": "TERM_MISSING", "severity": "blocker"}]), unit["id"]))
+    rejected = client.post(f"/api/files/{uploaded['id']}/confirm-manual-term-exceptions")
+    assert rejected.status_code == 409
 
 
 def test_qwen_translation_uses_bounded_parallel_requests(monkeypatch):

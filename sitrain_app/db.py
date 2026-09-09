@@ -42,7 +42,8 @@ def connect():
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
-  owner_id TEXT NOT NULL DEFAULT 'local-admin', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  owner_id TEXT NOT NULL DEFAULT 'local-admin', workflow_status TEXT NOT NULL DEFAULT 'waiting_start',
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS project_members (
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -121,6 +122,11 @@ CREATE INDEX IF NOT EXISTS idx_review_changes_file ON review_changes(file_id,cre
 def init_db() -> None:
     with _lock, connect() as conn:
         conn.executescript(SCHEMA)
+        project_columns = {r[1] for r in conn.execute("PRAGMA table_info(projects)").fetchall()}
+        if "workflow_status" not in project_columns:
+            # Existing projects used the old immediate-start behavior. Preserve
+            # their ability to resume rather than silently pausing work.
+            conn.execute("ALTER TABLE projects ADD COLUMN workflow_status TEXT NOT NULL DEFAULT 'translating'")
         provider_columns = {r[1] for r in conn.execute("PRAGMA table_info(providers)").fetchall()}
         if "last_test_status" not in provider_columns:
             conn.execute("ALTER TABLE providers ADD COLUMN last_test_status TEXT NOT NULL DEFAULT 'untested'")

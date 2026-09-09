@@ -10,7 +10,7 @@ from pathlib import Path
 import uvicorn
 
 ROOT = Path(__file__).resolve().parents[1]
-PORT = int(os.getenv("SITRAIN_PORT", "8080"))
+PORT = int(os.getenv("SITRAIN_PORT", "9000"))
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
 (ROOT / "sitrain_data").mkdir(exist_ok=True)

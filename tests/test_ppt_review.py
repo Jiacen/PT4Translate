@@ -14,7 +14,7 @@ from pptx.util import Inches, Pt
 
 from sitrain_app import db, storage, main
 from sitrain_app.pipeline import add_version
-from sitrain_app.review_versions import current_version, preview_source
+from sitrain_app.review_versions import apply_safe_machine_term_repairs, current_version, preview_source
 
 
 def png(color):
@@ -193,6 +193,34 @@ def test_review_assist_uses_structural_source_mapping_for_memory_and_same_source
     assert memory.status_code == 200, memory.text
     assert db.scalar("SELECT target FROM translation_memory WHERE source='Shared source'") == '共享术语'
     assert db.scalar("SELECT COUNT(*) FROM review_changes WHERE file_id=?", (fid,)) == 2
+
+
+def test_safe_term_repair_updates_only_untouched_ppt_objects(deck_client):
+    client, fid, _original = deck_client
+    first = client.get(f'/api/files/{fid}/pages/1/objects').json()
+    second = client.get(f'/api/files/{fid}/pages/2/objects').json()
+    edited = next(o for o in first['objects'] if o['paragraphs'] == ['Shared source'])
+    untouched = next(o for o in second['objects'] if o['paragraphs'] == ['Shared source'])
+    now = db.utcnow()
+    for number, page, obj in ((1, 1, edited), (2, 2, untouched)):
+        ref = obj['unit_refs'][0]
+        db.execute("""INSERT INTO translation_units(id,file_id,stable_key,page,object_ref,unit_type,source_text,machine_text,status,source_payload_json,updated_at)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                   (f'term-{number}', fid, f'term-{number}', page, str(page), ref['type'], 'Shared source',
+                    '旧译文', 'terminology_issue', __import__('json').dumps({**ref, 'value': 'Shared source'}), now))
+    saved = client.patch(f'/api/files/{fid}/pages/1/text', json={'base_version': first['version_id'],
+                         'object_id': edited['id'], 'paragraphs': ['老师修改']})
+    assert saved.status_code == 200
+    units = db.rows("SELECT * FROM translation_units WHERE file_id=? ORDER BY stable_key", (fid,))
+    for unit in units:
+        unit['machine_text'] = '已按术语修正'
+    result = apply_safe_machine_term_repairs(fid, units)
+    assert result['applied'] == 1 and result['skipped'] == 1
+    assert client.get(f'/api/files/{fid}/pages/1/objects').json()['objects']
+    page_one = client.get(f'/api/files/{fid}/pages/1/objects').json()
+    page_two = client.get(f'/api/files/{fid}/pages/2/objects').json()
+    assert next(o for o in page_one['objects'] if o['id'] == edited['id'])['paragraphs'] == ['老师修改']
+    assert next(o for o in page_two['objects'] if o['id'] == untouched['id'])['paragraphs'] == ['已按术语修正']
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Native PowerPoint smoke test is Windows-only')

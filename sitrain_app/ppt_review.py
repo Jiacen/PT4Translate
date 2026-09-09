@@ -11,6 +11,7 @@ from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 import posixpath
+import re
 import uuid
 import zipfile
 
@@ -236,3 +237,76 @@ def edit_pptx(source: Path, output: Path, page: int, object_id: str,
                 out.writestr(name, content)
     # Fail before registering a version if the package cannot be opened.
     Presentation(output)
+
+
+def edit_pptx_unit_texts(source: Path, output: Path, updates: list[dict]) -> list[int]:
+    """Patch extracted PPT text units in one immutable copy.
+
+    This is used by the terminology safety net.  It intentionally works from
+    the structural locator captured at extraction time, never from a search of
+    visible text.  Consequently a repeated label on a slide cannot be changed
+    by accident.  The caller has already excluded objects a teacher edited.
+    """
+    with zipfile.ZipFile(source) as z:
+        slide_parts = sorted((item.filename for item in z.infolist()
+                              if item.filename.startswith("ppt/slides/slide") and item.filename.endswith(".xml")),
+                             key=lambda name: int(re.search(r"slide(\d+)\.xml$", name).group(1)))
+        roots: dict[str, etree._Element] = {}
+        changed: dict[str, bytes] = {}
+        changed_pages: set[int] = set()
+
+        def part_root(part: str):
+            if part not in roots:
+                roots[part] = xml(z.read(part))
+            return roots[part]
+
+        for update in updates:
+            payload = update.get("source_payload") or {}
+            page = update.get("page") or payload.get("slide_index")
+            if not isinstance(page, int) or not 1 <= page <= len(slide_parts):
+                continue
+            kind = update.get("unit_type") or payload.get("type")
+            if kind == "notes":
+                part = slide_parts[page - 1].replace("slides/slide", "notesSlides/notesSlide")
+                if part not in z.namelist():
+                    continue
+                paragraphs = part_root(part).xpath(".//a:p", namespaces=NS)
+                index = payload.get("paragraph_index")
+            elif kind == "text_paragraph":
+                part = slide_parts[page - 1]
+                bodies = part_root(part).xpath(".//p:txBody", namespaces=NS)
+                box_index, index = payload.get("text_box_index"), payload.get("paragraph_index")
+                if not isinstance(box_index, int) or not 1 <= box_index <= len(bodies):
+                    continue
+                paragraphs = bodies[box_index - 1].xpath("./a:p", namespaces=NS)
+            elif kind == "table_cell_paragraph":
+                part = slide_parts[page - 1]
+                tables = part_root(part).xpath(".//a:tbl", namespaces=NS)
+                table_index = payload.get("table_index")
+                if not isinstance(table_index, int) or not 1 <= table_index <= len(tables):
+                    continue
+                rows = tables[table_index - 1].xpath(".//a:tr", namespaces=NS)
+                row_index, cell_index, index = payload.get("row_index"), payload.get("cell_index"), payload.get("paragraph_index")
+                if not isinstance(row_index, int) or not isinstance(cell_index, int) or not 0 <= row_index < len(rows):
+                    continue
+                cells = rows[row_index].xpath(".//a:tc", namespaces=NS)
+                if not 0 <= cell_index < len(cells):
+                    continue
+                paragraphs = cells[cell_index].xpath(".//a:p", namespaces=NS)
+            else:
+                continue
+            if not isinstance(index, int) or not 0 <= index < len(paragraphs):
+                continue
+            replace_text(paragraphs[index], (update.get("text") or "").replace("␊", "\n").replace("␍", "\r"))
+            changed[part] = serialize(roots[part])
+            changed_pages.add(page)
+
+        if not changed:
+            return []
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(output, "x", compression=zipfile.ZIP_DEFLATED) as out:
+            for item in z.infolist():
+                out.writestr(item, changed.get(item.filename, z.read(item.filename)))
+    # Reject a damaged package before it is recorded as a review version.
+    Presentation(output)
+    return sorted(changed_pages)

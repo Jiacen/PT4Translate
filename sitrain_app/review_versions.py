@@ -8,7 +8,7 @@ from fastapi import HTTPException
 
 from . import db
 from .storage import file_dir
-from .ppt_review import edit_pptx, page_objects
+from .ppt_review import edit_pptx, edit_pptx_unit_texts, page_objects
 from .terminology import normalize
 
 edit_lock = threading.RLock()
@@ -50,7 +50,7 @@ def preview_source(version, page):
     while version["id"] not in seen:
         seen.add(version["id"])
         meta = version.get("metadata") or {}
-        if meta.get("edited_page") == page or not meta.get("base_version"):
+        if meta.get("edited_page") == page or page in meta.get("edited_pages", []) or not meta.get("base_version"):
             break
         parent = db.row("SELECT * FROM file_versions WHERE id=? AND file_id=?",
                         (meta["base_version"], version["file_id"]))
@@ -65,7 +65,8 @@ def preview_source(version, page):
     # Only the page modified by this review version needs a new render. All other
     # pages keep the completed machine-version cache, including legacy published
     # files that predate review-version lineage metadata.
-    changed_page = (version.get("metadata") or {}).get("edited_page") == page
+    meta = version.get("metadata") or {}
+    changed_page = meta.get("edited_page") == page or page in meta.get("edited_pages", [])
     cache = root / version["id"] if changed_page else root
     return Path(version["path"]), cache
 
@@ -151,6 +152,72 @@ def _write_text_edit(file_id, page, object_id, base_version, paragraphs):
     _record_text_changes(file_id, page, object_id, version, paragraphs)
     return add_version(file_id, "review", output, {"base_version": base_version,
                        "edited_page": page, "object_id": object_id, "edit_kind": "text"})
+
+
+def _object_for_unit(file_id, version, unit):
+    """Find a PPT canvas object from an extraction locator, if it is unique."""
+    page = unit.get("page")
+    if not page:
+        return None
+    try:
+        source = Path(version["path"])
+        data = page_objects(str(source), source.stat().st_mtime_ns, page)
+    except (OSError, ValueError):
+        return None
+    found = []
+    for obj in data["objects"]:
+        for reference in obj.get("unit_refs", []):
+            if _payload_matches(reference, unit):
+                found.append(obj["id"])
+    return found[0] if len(found) == 1 else None
+
+
+@serialized
+def apply_safe_machine_term_repairs(file_id, units):
+    """Merge repaired machine terms into a reviewed PPT without touching edits.
+
+    A review version is the teacher's working copy.  We only patch paragraph
+    locators that can be proved and whose *entire canvas object* has never been
+    edited.  Speaker notes have no browser editing surface, so their structural
+    paragraphs can be safely refreshed too.  Everything uncertain is skipped
+    and remains visible to QA instead of risking a silent overwrite.
+    """
+    if not units:
+        return {"version_id": None, "applied": 0, "skipped": 0}
+    version = current_version(file_id)
+    source = Path(version["path"])
+    if source.suffix.lower() != ".pptx":
+        return {"version_id": None, "applied": 0, "skipped": len(units)}
+    edited = {(item["page"], item["object_id"])
+              for item in db.rows("SELECT page,object_id FROM review_changes WHERE file_id=?", (file_id,))}
+    updates, skipped = [], 0
+    for unit in units:
+        kind = unit.get("unit_type")
+        if kind == "notes":
+            updates.append({**unit, "text": unit.get("machine_text")})
+            continue
+        if kind not in {"text_paragraph", "table_cell_paragraph"}:
+            skipped += 1
+            continue
+        object_id = _object_for_unit(file_id, version, unit)
+        if not object_id or (unit.get("page"), object_id) in edited:
+            skipped += 1
+            continue
+        updates.append({**unit, "text": unit.get("machine_text")})
+    if not updates:
+        return {"version_id": None, "applied": 0, "skipped": skipped}
+    output = file_dir(file_id) / "review" / db.new_id() / source.name
+    try:
+        pages = edit_pptx_unit_texts(source, output, updates)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, f"术语修正未写入 PPT：{exc}") from exc
+    if not pages:
+        return {"version_id": None, "applied": 0, "skipped": skipped + len(updates)}
+    from .pipeline import add_version
+    version_id = add_version(file_id, "review", output, {"base_version": version["id"],
+                              "edited_pages": pages, "edit_kind": "safe_term_repair"})
+    db.execute("UPDATE files SET updated_at=? WHERE id=?", (db.utcnow(), file_id))
+    return {"version_id": version_id, "applied": len(updates), "skipped": skipped}
 
 
 @serialized
