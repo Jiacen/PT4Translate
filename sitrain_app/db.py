@@ -107,7 +107,8 @@ CREATE TABLE IF NOT EXISTS ppt_word_mappings (
   id TEXT PRIMARY KEY, chapter_id TEXT NOT NULL REFERENCES chapters(id) ON DELETE CASCADE,
   ppt_file_id TEXT NOT NULL REFERENCES files(id), word_file_id TEXT NOT NULL REFERENCES files(id),
   slide_number INTEGER NOT NULL, media_part TEXT NOT NULL, confidence REAL NOT NULL,
-  confirmed INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+  confirmed INTEGER NOT NULL DEFAULT 0, candidates_json TEXT NOT NULL DEFAULT '[]',
+  decision TEXT NOT NULL DEFAULT 'pending', updated_at TEXT NOT NULL,
   UNIQUE(word_file_id, media_part)
 );
 CREATE INDEX IF NOT EXISTS idx_files_chapter ON files(chapter_id);
@@ -130,6 +131,11 @@ def init_db() -> None:
         glossary_columns = {r[1] for r in conn.execute("PRAGMA table_info(glossary_terms)").fetchall()}
         if "chinese_aliases_json" not in glossary_columns:
             conn.execute("ALTER TABLE glossary_terms ADD COLUMN chinese_aliases_json TEXT NOT NULL DEFAULT '[]'")
+        mapping_columns = {r[1] for r in conn.execute("PRAGMA table_info(ppt_word_mappings)").fetchall()}
+        if "candidates_json" not in mapping_columns:
+            conn.execute("ALTER TABLE ppt_word_mappings ADD COLUMN candidates_json TEXT NOT NULL DEFAULT '[]'")
+        if "decision" not in mapping_columns:
+            conn.execute("ALTER TABLE ppt_word_mappings ADD COLUMN decision TEXT NOT NULL DEFAULT 'pending'")
         if conn.execute("SELECT COUNT(*) FROM providers").fetchone()[0] == 0:
             now = utcnow()
             presets = [

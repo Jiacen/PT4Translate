@@ -1,0 +1,32 @@
+[
+    {
+        "id": 1,
+        "count_src": 1,
+        "type": "paragraph",
+        "is_heading": false,
+        "heading_level": null,
+        "has_numbering": false,
+        "numbering_info": null,
+        "element_index": 0,
+        "style_info": {},
+        "value": "Introduction",
+        "original_pPr": null,
+        "original_structure": {
+            "total_runs": 1,
+            "runs_info": [
+                {
+                    "index": 0,
+                    "has_text": true,
+                    "has_fields": false,
+                    "has_drawings": false,
+                    "has_breaks": false,
+                    "has_math": false,
+                    "rPr_xml": null
+                }
+            ],
+            "has_fields": false,
+            "has_drawings": false,
+            "has_math": false
+        }
+    }
+]

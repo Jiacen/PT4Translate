@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from sitrain_app import db, pipeline, storage
 from sitrain_app import main
 from sitrain_app.main import app
-from sitrain_app.terminology import residual_source_issues
+from sitrain_app.terminology import Term, TerminologyEngine, residual_source_issues
 
 
 @pytest.fixture()
@@ -209,6 +209,42 @@ def test_single_digit_chinese_equivalents_do_not_block_release():
     assert not [issue for issue in residual_source_issues("Level 3", "第三级") if issue["code"] == "NUMBER_CHANGED"]
     assert not [issue for issue in residual_source_issues("2-phasig", "两相") if issue["code"] == "NUMBER_CHANGED"]
     assert [issue for issue in residual_source_issues("24 V", "二十四伏") if issue["code"] == "NUMBER_CHANGED"]
+
+
+def test_short_uppercase_glossary_term_does_not_match_lowercase_word():
+    engine = TerminologyEngine([Term("to", "TO", "工艺对象")])
+    protected, _mapping = engine.protect("Click to continue")
+    assert protected == "Click to continue"
+    assert not engine.validate("Click to continue", "单击以继续")
+
+
+def test_ppt_alttext_qa_warns_but_does_not_block_release():
+    from sitrain_app.pipeline import _qa_issues
+    engine = TerminologyEngine([])
+    issues = _qa_issues({"unit_type": "ppt_alttext", "source_text": "click left 2"}, engine, "单击左侧")
+    assert any(issue["code"] == "NUMBER_CHANGED" and issue["severity"] == "warning" for issue in issues)
+
+
+def test_word_page_field_qa_warns_but_does_not_block_release():
+    from sitrain_app.pipeline import _qa_issues
+    engine = TerminologyEngine([])
+    unit = {"unit_type": "header_footer", "source_text": "{{PAGE_NUMBER}}1", "source_payload": {"field_info": [{"type": "field_instruction"}]}}
+    issues = _qa_issues(unit, engine, "{{PAGE_NUMBER}}")
+    assert any(issue["code"] == "NUMBER_CHANGED" and issue["severity"] == "warning" for issue in issues)
+
+
+def test_glossary_change_rechecks_unconfirmed_qa_without_overwriting_text(client):
+    uploaded = client.post("/api/files/upload", files={"upload": ("manual.txt", b"Click to continue\n", "text/plain")}).json()
+    unit = client.get(f"/api/files/{uploaded['id']}/units").json()["units"][0]
+    db.execute("UPDATE translation_units SET machine_text=?,human_text=?,status='terminology_issue',qa_json=? WHERE id=?",
+               ("单击以继续", "人工译文保持不变", json.dumps([{"code":"TERM_MISSING","severity":"blocker"}]), unit["id"]))
+    result = client.post("/api/glossary", json={"source":"TO", "target":"工艺对象"})
+    assert result.status_code == 200
+    assert result.json()["revalidation"]["units"] >= 1
+    refreshed = client.get(f"/api/files/{uploaded['id']}/units").json()["units"][0]
+    assert refreshed["human_text"] == "人工译文保持不变"
+    assert refreshed["status"] == "pending_review"
+    assert not [issue for issue in refreshed["qa"] if issue["code"] == "TERM_MISSING"]
 
 
 def test_qwen_translation_uses_bounded_parallel_requests(monkeypatch):

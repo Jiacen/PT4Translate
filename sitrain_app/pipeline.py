@@ -119,6 +119,51 @@ def _terms(project_id: str | None, source_language: str, target_language: str) -
     return records,TerminologyEngine(terms)
 
 
+@serialized
+def revalidate_terminology_qa(project_id: str | None = None) -> dict[str, int]:
+    """Refresh editable units' QA after a glossary change, without altering text."""
+    file_sql = "SELECT * FROM files WHERE status IN ('review','published')"
+    params: tuple = ()
+    if project_id is not None:
+        file_sql += " AND project_id=?"
+        params = (project_id,)
+    files = db.rows(file_sql, params)
+    checked = blockers = 0
+    now = db.utcnow()
+    with db.connect() as conn:
+        for file in files:
+            _records, engine = _terms(file.get("project_id"), file["source_language"], file["target_language"])
+            units = db.rows("SELECT * FROM translation_units WHERE file_id=? AND status NOT IN ('confirmed','skipped_image')", (file["id"],))
+            for unit in units:
+                translated = unit.get("human_text") or unit.get("machine_text")
+                if translated is None:
+                    continue
+                issues = _qa_issues(unit, engine, translated)
+                has_term_blocker = any(issue["code"] == "TERM_MISSING" and issue["severity"] == "blocker" for issue in issues)
+                status = "terminology_issue" if has_term_blocker else ("pending_review" if unit["status"] == "terminology_issue" else unit["status"])
+                conn.execute("UPDATE translation_units SET qa_json=?,status=?,updated_at=? WHERE id=?",
+                             (json.dumps(issues, ensure_ascii=False), status, now, unit["id"]))
+                checked += 1
+                blockers += sum(1 for issue in issues if issue.get("severity") == "blocker")
+    return {"files": len(files), "units": checked, "blockers": blockers}
+
+
+def _qa_issues(unit: dict, engine: TerminologyEngine, translated: str) -> list[dict]:
+    issues = engine.validate(unit["source_text"], translated) + residual_source_issues(unit["source_text"], translated)
+    # Slide-layout alternative descriptions are non-visual accessibility
+    # metadata.  They are not editable in the slide review canvas, so they
+    # must be reported without making a teacher unable to publish a deck.
+    payload = unit.get("source_payload") or {}
+    is_word_field = unit.get("unit_type") == "header_footer" and bool(payload.get("field_info"))
+    if unit.get("unit_type") == "ppt_alttext" or is_word_field:
+        for issue in issues:
+            if issue.get("severity") == "blocker":
+                issue["severity"] = "warning"
+                label = "PPT 辅助描述" if unit.get("unit_type") == "ppt_alttext" else "Word 自动字段"
+                issue["message"] = label + "：" + issue["message"]
+    return issues
+
+
 def run_translation(task_id: str, provider_id: str | None = None) -> None:
     task = db.row("SELECT * FROM tasks WHERE id=?",(task_id,))
     if not task or task["status"] != "queued":
@@ -154,7 +199,7 @@ def run_translation(task_id: str, provider_id: str | None = None) -> None:
         with db.connect() as conn:
             for unit in units:
                 translated = engine.restore(result[unit["stable_key"]],protected_map.get(unit["stable_key"],{}))
-                issues = engine.validate(unit["source_text"],translated)+residual_source_issues(unit["source_text"],translated)
+                issues = _qa_issues(unit, engine, translated)
                 status = "terminology_issue" if any(x["code"]=="TERM_MISSING" for x in issues) else "pending_review"
                 conn.execute("UPDATE translation_units SET machine_text=?,status=?,qa_json=?,revision=revision+1,updated_at=? WHERE id=?",
                              (translated,status,json.dumps(issues,ensure_ascii=False),db.utcnow(),unit["id"]))

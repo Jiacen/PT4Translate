@@ -1,0 +1,22 @@
+[
+    {
+        "count_src": 1,
+        "slide_index": 1,
+        "text_box_index": 1,
+        "paragraph_index": 0,
+        "type": "text_paragraph",
+        "value": "Operator control panel",
+        "run_texts": [
+            "Operator control panel"
+        ],
+        "run_styles": [
+            {
+                "font_size": "2400"
+            }
+        ],
+        "run_lengths": [
+            22
+        ],
+        "xpath": ".//p:txBody[1]//a:p[1]"
+    }
+]

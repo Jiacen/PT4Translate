@@ -31,8 +31,12 @@ class TerminologyEngine:
         for term in self.terms:
             variants = sorted({term.source, *term.aliases}, key=len, reverse=True)
             for variant in variants:
-                flags = 0 if term.case_sensitive else re.IGNORECASE
-                pattern = re.compile(r"(?<!\w)" + re.escape(variant) + r"(?!\w)", flags)
+                # Short all-caps terms are acronyms.  Treating TO as case
+                # insensitive would incorrectly match the English preposition
+                # "to" in ordinary sentences.
+                acronym = variant.isupper() and len(variant) <= 3
+                flags = 0 if term.case_sensitive or acronym else re.IGNORECASE
+                pattern = re.compile(r"(?<![A-Za-z0-9])" + re.escape(variant) + r"(?![A-Za-z0-9])", flags)
                 if pattern.search(protected):
                     token = f"\ue000TERM_{len(mapping):04d}\ue001"
                     protected = pattern.sub(token, protected)
@@ -45,13 +49,22 @@ class TerminologyEngine:
         for token, (term, source_variant) in mapping.items():
             replacement = source_variant if term.mode in {"keep", "forbidden"} else term.target
             translated = translated.replace(token, replacement)
+            # Some MT providers translate the human-readable TERM label inside
+            # the private-use token.  Restore that known structural variant.
+            token_no = re.search(r"_(\d{4})\ue001$", token)
+            if token_no:
+                translated = re.sub(r"\ue000(?:TERM|变量)_" + token_no.group(1) + r"\ue001", replacement, translated)
         return translated
 
     def validate(self, source: str, translated: str) -> list[dict]:
         issues = []
         src_norm, dst_norm = normalize(source), normalize(translated)
         for term in self.terms:
-            present = any(normalize(v) in src_norm for v in (term.source, *term.aliases))
+            def occurs(variant: str) -> bool:
+                acronym = variant.isupper() and len(variant) <= 3
+                flags = 0 if term.case_sensitive or acronym else re.IGNORECASE
+                return bool(re.search(r"(?<![A-Za-z0-9])" + re.escape(variant) + r"(?![A-Za-z0-9])", source, flags))
+            present = any(occurs(v) for v in (term.source, *term.aliases))
             if not present:
                 continue
             required = term.source if term.mode in {"keep", "forbidden"} else term.target

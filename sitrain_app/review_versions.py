@@ -29,11 +29,14 @@ def current_version(file_id):
     # published.  This preserves a safe, editable machine/review version when
     # an unverified mapping needs correction.
     if not file or file["status"] != "published":
-        order = "CASE version_type WHEN 'review' THEN 0 WHEN 'machine' THEN 1 WHEN 'published' THEN 2 WHEN 'working' THEN 3 ELSE 4 END"
+        order = "CASE version_type WHEN 'review' THEN 0 WHEN 'sync_review' THEN 1 WHEN 'machine' THEN 2 WHEN 'published' THEN 3 WHEN 'working' THEN 4 ELSE 5 END"
     else:
-        order = "CASE version_type WHEN 'published' THEN 0 WHEN 'review' THEN 1 WHEN 'machine' THEN 2 WHEN 'working' THEN 3 ELSE 4 END"
+        # A PPT→Word result is a distinct, immutable review candidate.  It
+        # becomes the active preview immediately so teachers inspect exactly
+        # the Word file that would be delivered, before accepting it.
+        order = "CASE version_type WHEN 'sync_review' THEN 0 WHEN 'published' THEN 1 WHEN 'review' THEN 2 WHEN 'machine' THEN 3 WHEN 'working' THEN 4 ELSE 5 END"
     version = db.row("""SELECT * FROM file_versions WHERE file_id=?
-        AND version_type IN ('review','published','machine','working','original')
+        AND version_type IN ('review','sync_review','published','machine','working','original')
         ORDER BY """ + order + ",sequence DESC LIMIT 1", (file_id,))
     if not version:
         raise HTTPException(404, "文件版本不存在")

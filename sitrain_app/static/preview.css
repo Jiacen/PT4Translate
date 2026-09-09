@@ -24,3 +24,6 @@
 .ppt-review-assist p{margin:7px 0}.ppt-review-assist code{word-break:break-word;color:#075c63}
 .ppt-assist-actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
 .ppt-review-assist input{display:block;width:100%;margin:4px 0 9px}
+.word-review-layout{min-width:0}
+.word-review-layout>#word-preview-stage{min-width:0;overflow:auto}
+.word-review-layout>#word-review-panel{min-width:0}

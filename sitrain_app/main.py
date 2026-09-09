@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import re
 import threading
@@ -8,8 +9,10 @@ import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from PIL import Image
+
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -21,10 +24,11 @@ from .review_versions import (apply_same_source, current_version, preview_source
                               review_context, save_edit, save_review_memory, serialized)
 from .glossary_excel import export_global_terms, parse_global_terms
 from .pipeline import (add_version, prepare_file, publish, refresh_machine_version,
-                       run_translation, schedule_translation, start_automatic_translation)
+                       revalidate_terminology_qa, run_translation, schedule_translation,
+                       start_automatic_translation)
 from .providers import ProviderError, TranslationRequest, translate
 from .storage import checksum, file_dir, save_upload
-from .sync import apply_sync, create_mappings
+from .sync import _latest, apply_sync, create_mappings
 from .terminology import normalize
 
 STATIC = Path(__file__).parent/"static"
@@ -115,6 +119,11 @@ class MappingPatch(BaseModel):
     confirmed: bool = True
 
 
+class MappingDecision(BaseModel):
+    slide_number: int | None = Field(default=None, ge=1)
+    keep_original: bool = False
+
+
 def _chapter_key(filename: str) -> str:
     stem = Path(filename).stem.casefold()
     return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "_", stem).strip("_") or "unnamed"
@@ -163,6 +172,10 @@ def project_get(project_id: str):
     project["chapters"] = db.rows("SELECT * FROM chapters WHERE project_id=? ORDER BY position,created_at",(project_id,))
     for chapter in project["chapters"]:
         chapter["files"] = db.rows("SELECT * FROM files WHERE chapter_id=? ORDER BY created_at",(chapter["id"],))
+        for file in chapter["files"]:
+            review = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (file["id"],))
+            if review:
+                file["sync_review"] = {"id": review["id"], **(review.get("metadata") or {})}
     return project
 
 
@@ -252,6 +265,9 @@ def file_get(file_id: str):
     item=db.row("SELECT * FROM files WHERE id=?",(file_id,))
     if not item: raise HTTPException(404,"文件不存在")
     item["versions"]=db.rows("SELECT id,version_type,sequence,size,checksum,metadata_json,created_at FROM file_versions WHERE file_id=? ORDER BY created_at",(file_id,))
+    review = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (file_id,))
+    if review:
+        item["sync_review"] = {"id": review["id"], **(review.get("metadata") or {})}
     item["unit_counts"]={r["status"]:r["n"] for r in db.rows("SELECT status,COUNT(*) n FROM translation_units WHERE file_id=? GROUP BY status",(file_id,))}
     return item
 
@@ -379,6 +395,20 @@ def file_publish(file_id: str):
     return {"version_id":vid}
 
 
+@app.get("/api/files/{file_id}/qa-blockers")
+def file_qa_blockers(file_id: str):
+    if not db.row("SELECT id FROM files WHERE id=?", (file_id,)):
+        raise HTTPException(404, "文件不存在")
+    blockers = []
+    for unit in db.rows("SELECT * FROM translation_units WHERE file_id=? AND status<>'confirmed' ORDER BY page,stable_key", (file_id,)):
+        for issue in unit.get("qa") or []:
+            if issue.get("severity") == "blocker":
+                blockers.append({"unit_id": unit["id"], "page": unit.get("page"), "object_ref": unit.get("object_ref"),
+                                 "source_text": unit["source_text"], "target_text": unit.get("human_text") or unit.get("machine_text") or "",
+                                 "code": issue.get("code"), "message": issue.get("message", "需要校对")})
+    return {"blockers": blockers}
+
+
 @app.get("/api/versions/{version_id}/download")
 def download(version_id: str):
     version=db.row("SELECT * FROM file_versions WHERE id=?",(version_id,))
@@ -457,7 +487,8 @@ def glossary(project_id: str|None=None):
 def glossary_add(body: TermIn):
     tid=db.new_id(); db.execute("INSERT INTO glossary_terms(id,project_id,source,target,aliases_json,chinese_aliases_json,mode,case_sensitive,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
                                (tid,body.project_id,body.source,body.target,json.dumps(body.aliases,ensure_ascii=False),json.dumps(body.chinese_aliases,ensure_ascii=False),body.mode,int(body.case_sensitive),db.utcnow()))
-    return db.row("SELECT * FROM glossary_terms WHERE id=?",(tid,))
+    term = db.row("SELECT * FROM glossary_terms WHERE id=?",(tid,))
+    return {**term, "revalidation": revalidate_terminology_qa(body.project_id)}
 
 
 @app.put("/api/glossary/{term_id}")
@@ -473,15 +504,17 @@ def glossary_update(term_id: str, body: TermIn):
                (body.source, body.target, json.dumps(body.aliases, ensure_ascii=False),
                 json.dumps(body.chinese_aliases, ensure_ascii=False), body.mode,
                 int(body.case_sensitive), db.utcnow(), term_id))
-    return db.row("SELECT * FROM glossary_terms WHERE id=?", (term_id,))
+    term = db.row("SELECT * FROM glossary_terms WHERE id=?", (term_id,))
+    return {**term, "revalidation": revalidate_terminology_qa(current.get("project_id"))}
 
 
 @app.delete("/api/glossary/{term_id}")
 def glossary_delete(term_id: str):
-    if not db.row("SELECT id FROM glossary_terms WHERE id=?", (term_id,)):
+    current = db.row("SELECT * FROM glossary_terms WHERE id=?", (term_id,))
+    if not current:
         raise HTTPException(404, "术语不存在")
     db.execute("DELETE FROM glossary_terms WHERE id=?", (term_id,))
-    return {"ok": True}
+    return {"ok": True, "revalidation": revalidate_terminology_qa(current.get("project_id"))}
 
 
 @app.get("/api/glossary/export")
@@ -516,7 +549,8 @@ async def glossary_import(upload: UploadFile = File(...)):
                          (db.new_id(), None, source, str(term["target"]), json.dumps(term["aliases"], ensure_ascii=False), json.dumps(term["chinese_aliases"], ensure_ascii=False), "required", 0, db.utcnow()))
             existing.add(key)
             added += 1
-    return {"added": added, "skipped": skipped, "invalid": len(errors), "errors": errors[:20]}
+    revalidation = revalidate_terminology_qa() if added else {"files": 0, "units": 0, "blockers": 0}
+    return {"added": added, "skipped": skipped, "invalid": len(errors), "errors": errors[:20], "revalidation": revalidation}
 
 
 @app.post("/api/chapters/{chapter_id}/sync/map")
@@ -527,8 +561,42 @@ def sync_map(chapter_id: str):
 
 @app.post("/api/chapters/{chapter_id}/sync/apply")
 def sync_apply(chapter_id: str):
-    try: return {"version_id":apply_sync(chapter_id)}
+    try:
+        version_id = apply_sync(chapter_id)
+        version = db.row("SELECT * FROM file_versions WHERE id=?", (version_id,))
+        return {"version_id":version_id, "word_file_id":version.get("file_id"), "mapping_count":(version.get("metadata") or {}).get("mapping_count", 0),
+                "unmapped_count":(version.get("metadata") or {}).get("unmapped_count", 0),
+                "pending_count":(version.get("metadata") or {}).get("pending_count", 0),
+                "changed_pages":(version.get("metadata") or {}).get("changed_pages", [])}
     except RuntimeError as exc: raise HTTPException(409,str(exc)) from exc
+
+
+@app.post("/api/files/{file_id}/sync-review/confirm")
+def sync_review_confirm(file_id: str):
+    version = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (file_id,))
+    if not version:
+        raise HTTPException(409, "当前 Word 没有待确认的同步后校验版")
+    metadata = version.get("metadata") or {}
+    metadata["sync_review_confirmed"] = True
+    metadata["sync_review_confirmed_at"] = db.utcnow()
+    db.execute("UPDATE file_versions SET metadata_json=? WHERE id=?", (json.dumps(metadata, ensure_ascii=False), version["id"]))
+    return {"version_id": version["id"], "changed_pages": metadata.get("changed_pages") or []}
+
+
+def _chapter_delivery_versions(chapter_id: str) -> list[dict]:
+    files = db.rows("SELECT * FROM files WHERE chapter_id=?", (chapter_id,))
+    versions = []
+    for file in files:
+        sync = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (file["id"],))
+        if sync and not (sync.get("metadata") or {}).get("sync_review_confirmed"):
+            raise HTTPException(409, f"{file['original_name']} 的 PPT 图片更新后尚未校验，请先打开 Word 完成“确认同步后 Word 交付”")
+        if sync and (sync.get("metadata") or {}).get("sync_review_confirmed"):
+            versions.append(sync)
+            continue
+        published = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='published' ORDER BY sequence DESC LIMIT 1", (file["id"],))
+        if published:
+            versions.append(published)
+    return versions
 
 
 @app.patch("/api/mappings/{mapping_id}")
@@ -540,11 +608,47 @@ def sync_mapping_confirm(mapping_id: str, body: MappingPatch):
     return db.row("SELECT * FROM ppt_word_mappings WHERE id=?",(mapping_id,))
 
 
+@app.get("/api/chapters/{chapter_id}/sync/pending")
+def sync_pending(chapter_id: str):
+    rows = db.rows("SELECT * FROM ppt_word_mappings WHERE chapter_id=? AND confirmed=0 AND decision<>'keep_original' ORDER BY media_part", (chapter_id,))
+    return {"mappings": rows}
+
+
+@app.get("/api/mappings/{mapping_id}/word-image")
+def sync_word_image(mapping_id: str):
+    mapping = db.row("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,))
+    if not mapping:
+        raise HTTPException(404, "图片映射不存在")
+    source = Path(_latest(mapping["word_file_id"], "working", "original")["path"])
+    try:
+        with zipfile.ZipFile(source) as archive:
+            image = Image.open(io.BytesIO(archive.read(mapping["media_part"]))).convert("RGB")
+        output = io.BytesIO(); image.save(output, "PNG")
+    except Exception as exc:
+        raise HTTPException(422, f"无法渲染 Word 图片：{exc}") from exc
+    return Response(output.getvalue(), media_type="image/png")
+
+
+@app.post("/api/mappings/{mapping_id}/decision")
+def sync_mapping_decision(mapping_id: str, body: MappingDecision):
+    mapping = db.row("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,))
+    if not mapping:
+        raise HTTPException(404, "图片映射不存在")
+    if body.keep_original:
+        db.execute("UPDATE ppt_word_mappings SET confirmed=0,decision='keep_original',updated_at=? WHERE id=?", (db.utcnow(), mapping_id))
+    elif body.slide_number:
+        db.execute("UPDATE ppt_word_mappings SET slide_number=?,confirmed=1,confidence=0.99,decision='manual',updated_at=? WHERE id=?",
+                   (body.slide_number, db.utcnow(), mapping_id))
+    else:
+        raise HTTPException(422, "请选择 PPT 页，或选择保留 Word 原图")
+    return db.row("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,))
+
+
 @app.get("/api/chapters/{chapter_id}/package")
 def chapter_package(chapter_id: str):
     chapter=db.row("SELECT * FROM chapters WHERE id=?",(chapter_id,))
     if not chapter: raise HTTPException(404,"章节不存在")
-    versions=db.rows("SELECT v.* FROM file_versions v JOIN files f ON f.id=v.file_id WHERE f.chapter_id=? AND v.version_type='published' AND v.sequence=(SELECT MAX(v2.sequence) FROM file_versions v2 WHERE v2.file_id=v.file_id AND v2.version_type='published')",(chapter_id,))
+    versions = _chapter_delivery_versions(chapter_id)
     if not versions: raise HTTPException(409,"章节尚无发布版本")
     target=file_dir(chapter_id)/f"{chapter['name']}_交付包.zip"
     if target.exists(): target=target.with_name(f"{target.stem}_{db.new_id()[:8]}.zip")
@@ -553,6 +657,29 @@ def chapter_package(chapter_id: str):
         report={"chapter":chapter["name"],"generated_at":db.utcnow(),"files":[{"name":Path(v["path"]).name,"sha256":v["checksum"]} for v in versions]}
         archive.writestr("QA-交付清单.json",json.dumps(report,ensure_ascii=False,indent=2))
     return FileResponse(target,filename=target.name)
+
+
+@app.get("/api/projects/{project_id}/package")
+def project_package(project_id: str):
+    project = db.row("SELECT * FROM projects WHERE id=?", (project_id,))
+    if not project:
+        raise HTTPException(404, "教材项目不存在")
+    versions = []
+    for chapter in db.rows("SELECT * FROM chapters WHERE project_id=? ORDER BY position, created_at", (project_id,)):
+        versions.extend([{**version, "chapter_name": chapter["name"]} for version in _chapter_delivery_versions(chapter["id"])])
+    if not versions:
+        raise HTTPException(409, "项目尚无可交付的发布版本")
+    target = file_dir(project_id) / f"{project['name']}_整体交付包.zip"
+    if target.exists():
+        target = target.with_name(f"{target.stem}_{db.new_id()[:8]}.zip")
+    with zipfile.ZipFile(target, "x", zipfile.ZIP_DEFLATED) as archive:
+        for version in versions:
+            archive.write(version["path"], str(Path(version["chapter_name"]) / Path(version["path"]).name))
+        report = {"project": project["name"], "generated_at": db.utcnow(),
+                  "files": [{"chapter": v["chapter_name"], "name": Path(v["path"]).name,
+                             "sha256": v["checksum"]} for v in versions]}
+        archive.writestr("QA-整体交付清单.json", json.dumps(report, ensure_ascii=False, indent=2))
+    return FileResponse(target, filename=target.name)
 
 
 app.mount("/",StaticFiles(directory=STATIC,html=True),name="static")

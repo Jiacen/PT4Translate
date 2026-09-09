@@ -1,5 +1,17 @@
 let reviewData=null, reviewSelection=null, reviewDirty=false, reviewSaving=false, reviewRequest=0, reviewWheelDelta=0, reviewWheelLock=false;
 let wordReviewUnits=[], wordSelectedUnitId=null;
+const reviewZoomByPage=new Map();
+
+function reviewZoomKey(){return `${activeFile||''}:${activePage||1}`}
+function currentReviewZoom(){return reviewZoomByPage.get(reviewZoomKey())||1}
+function applyReviewZoom(container){
+  const canvas=container?.querySelector('.ppt-canvas');if(!canvas)return;
+  const zoom=currentReviewZoom();
+  canvas.style.width=`${Math.round(zoom*100)}%`;
+  canvas.style.margin=zoom>1?'0':'0 auto';
+  const label=$('#review-zoom');if(label)label.textContent=`缩放 ${Math.round(zoom*100)}%`;
+}
+function resetReviewZoom(){reviewZoomByPage.delete(reviewZoomKey());applyReviewZoom($('#preview'));applyReviewZoom($('#word-preview-stage'))}
 
 async function continueReview(){
   if(!leaveReviewEdit())return;
@@ -45,7 +57,9 @@ async function showEditablePreview(id,page){
     reviewData={...data,fileId:id,page};
     const editable=activeFileDetail.status==='review';
     preview.classList.add('preview-switching');
-    preview.innerHTML=`<div class="ppt-review-controls"><span>${editable?'点击文字或图片进行修改；也可从对象列表选择。':'已发布版本 · 只读预览'}</span><select id="ppt-object-picker" aria-label="选择页面对象"><option value="">选择文字或图片…</option>${data.objects.map((o,i)=>`<option value="${i}">${esc(o.kind==='image'?'图片':'文字')} · ${esc(o.name)}</option>`).join('')}</select><button id="ppt-export" class="primary">发布并下载 PPTX</button></div><div class="ppt-canvas" style="aspect-ratio:${data.width}/${data.height}"><img id="ppt-page-image" alt="第 ${page} 页校对版" src="${imageUrl}"><div class="ppt-hit-layer" id="ppt-hit-layer" hidden>${editable?data.objects.map((o,i)=>`<button type="button" class="ppt-hit ${o.kind}" data-index="${i}" title="${esc(o.name)}" aria-label="编辑${esc(o.name)}" style="left:${o.box[0]*100}%;top:${o.box[1]*100}%;width:${o.box[2]*100}%;height:${o.box[3]*100}%;transform:rotate(${o.rotation}deg)"></button>`).join(''):''}</div></div><div id="ppt-render-status" role="status">预览与下载使用同一份 PPTX。修改后请检查文字是否溢出。</div><section id="ppt-editor" class="ppt-editor" hidden></section>`;
+    const chapterFile=activeFileDetail?.mode==='chapter';
+    preview.innerHTML=`<div class="ppt-review-controls"><span>${editable?'点击文字或图片进行修改；也可从对象列表选择。':'已发布版本 · 只读预览'}</span><select id="ppt-object-picker" aria-label="选择页面对象"><option value="">选择文字或图片…</option>${data.objects.map((o,i)=>`<option value="${i}">${esc(o.kind==='image'?'图片':'文字')} · ${esc(o.name)}</option>`).join('')}</select><button id="ppt-export" class="primary">${chapterFile?'确认并纳入章节交付':'发布并下载 PPTX'}</button></div><div class="ppt-canvas" style="aspect-ratio:${data.width}/${data.height}"><img id="ppt-page-image" alt="第 ${page} 页校对版" src="${imageUrl}"><div class="ppt-hit-layer" id="ppt-hit-layer" hidden>${editable?data.objects.map((o,i)=>`<button type="button" class="ppt-hit ${o.kind}" data-index="${i}" title="编辑${esc(o.name)}" aria-label="编辑${esc(o.name)}" style="left:${o.box[0]*100}%;top:${o.box[1]*100}%;width:${o.box[2]*100}%;height:${o.box[3]*100}%;transform:rotate(${o.rotation}deg)"></button>`).join(''):''}</div></div><div id="ppt-render-status" role="status">${chapterFile?'确认后的文件会进入章节交付；下载请在教材项目页使用“章节包”或“项目包”。':'预览与下载使用同一份 PPTX。修改后请检查文字是否溢出。'}</div><section id="ppt-editor" class="ppt-editor" hidden></section>`;
+    applyReviewZoom(preview);
     const img=$('#ppt-page-image');
     img.onload=()=>{if(ticket!==reviewRequest)return;$('#ppt-hit-layer').hidden=false;window.requestAnimationFrame(()=>preview.classList.remove('preview-switching'))};
     img.onerror=()=>{if(ticket!==reviewRequest)return;$('#ppt-render-status').textContent='预览生成失败；已保存的 PPTX 仍保留。可重新选择本页重试。'};
@@ -54,6 +68,7 @@ async function showEditablePreview(id,page){
     $('#ppt-object-picker').disabled=!editable;
     $('#ppt-object-picker').onchange=event=>{if(event.target.value!=='')selectPptObject(Number(event.target.value))};
     $('#ppt-export').onclick=()=>{if(reviewDirty){toast('请先保存或取消当前修改',true);return}if(!reviewSaving)doPublish(id)};
+    await focusPptQaBlocker(id,page,data);
     installPreviewWheelNavigation(preview);
   }catch(error){if(ticket===reviewRequest)preview.textContent=error.message}
 }
@@ -66,9 +81,14 @@ async function showWordReview(id,page,ticket){
     if(ticket!==reviewRequest)return;
     wordReviewUnits=(data.units||[]).filter(unit=>isMeaningfulWordUnit(unit));
     wordSelectedUnitId=wordReviewUnits.some(unit=>unit.id===wordSelectedUnitId)?wordSelectedUnitId:null;
+    if(window.qaFocus?.fileId===id&&window.qaFocus?.page===page&&wordReviewUnits.some(unit=>unit.id===window.qaFocus.unitId)){
+      wordSelectedUnitId=window.qaFocus.unitId;window.qaFocus=null;
+    }
     const imageUrl=`/api/files/${id}/preview/${page}?version_id=${encodeURIComponent(objects.version_id)}`;
     const stage=$('#word-preview-stage');
-    stage.innerHTML=`<div class="ppt-canvas" style="aspect-ratio:${objects.width}/${objects.height}"><img id="word-preview-image" alt="Word 第 ${page} 页预览" src="${imageUrl}"><div class="ppt-hit-layer" id="word-hit-layer" hidden>${objects.objects.map(object=>`<button type="button" class="ppt-hit text" data-unit-id="${object.unit_id}" title="编辑：${esc(object.name)}" aria-label="编辑 Word 文本：${esc(object.name)}" style="left:${object.box[0]*100}%;top:${object.box[1]*100}%;width:${object.box[2]*100}%;height:${object.box[3]*100}%"></button>`).join('')}</div></div><p>点击页面中的文字块即可编辑。嵌入的幻灯片图片将在配套 PPT 校对并完成同步后更新。</p>`;
+    const syncReview=Boolean(activeFileDetail?.sync_review&&!activeFileDetail.sync_review.sync_review_confirmed);
+    stage.innerHTML=`<div class="ppt-canvas" style="aspect-ratio:${objects.width}/${objects.height}"><img id="word-preview-image" alt="Word 第 ${page} 页预览" src="${imageUrl}"><div class="ppt-hit-layer" id="word-hit-layer" hidden>${objects.objects.map(object=>`<button type="button" class="ppt-hit text" data-unit-id="${object.unit_id}" title="${syncReview?'查看':'编辑'}：${esc(object.name)}" aria-label="${syncReview?'查看':'编辑'} Word 文本：${esc(object.name)}" style="left:${object.box[0]*100}%;top:${object.box[1]*100}%;width:${object.box[2]*100}%;height:${object.box[3]*100}%"></button>`).join('')}</div></div><p>${syncReview?'这是同步后 Word 校验版。带 ● 的页已替换 PPT 图片，请重点检查图片内容、裁剪和分页；确认无误后使用顶部“确认同步后 Word 交付”。':'点击页面中的文字块即可编辑。嵌入的幻灯片图片将在配套 PPT 校对并完成同步后更新。'}</p>`;
+    applyReviewZoom(stage);
     const image=$('#word-preview-image');
     image.onload=()=>{$('#word-hit-layer').hidden=false};
     if(image.complete&&image.naturalWidth)image.onload();
@@ -85,12 +105,27 @@ function isMeaningfulWordUnit(unit){
   return source.length>=2&&/[A-Za-z\u4e00-\u9fff]/.test(source);
 }
 
+async function focusPptQaBlocker(fileId,page,data){
+  const focus=window.qaFocus;
+  if(!focus||focus.fileId!==fileId||focus.page!==page)return;
+  try{
+    const units=(await api(`/api/files/${fileId}/units`)).units||[];
+    const unit=units.find(item=>item.id===focus.unitId), payload=unit?.source_payload||{};
+    const fields=['type','text_box_index','table_index','row_index','cell_index','paragraph_index'];
+    const index=data.objects.findIndex(object=>(object.unit_refs||[]).some(reference=>fields.every(field=>!(field in reference)||reference[field]===payload[field])));
+    window.qaFocus=null;
+    if(index>=0)selectPptObject(index);else toast('已跳转到对应页，但未能自动定位到文字对象，请在页面上点击该段文字',true);
+  }catch(error){window.qaFocus=null;toast(`已跳转到对应页：${error.message}`,true)}
+}
+
 function wordSelectedUnit(){return wordReviewUnits.find(unit=>unit.id===wordSelectedUnitId)||null}
 
 function renderWordReviewPanel(){
   const panel=$('#word-review-panel');if(!panel)return;
   const selected=wordSelectedUnit();
+  const syncReview=Boolean(activeFileDetail?.sync_review&&!activeFileDetail.sync_review.sync_review_confirmed);
   if(!selected){panel.innerHTML=`<div class="ppt-editor-heading"><b>Word 文本校对</b><span>${wordReviewUnits.length} 条可编辑内容</span></div><p>请先点击左侧 Word 页面中的正文文字。这里会显示对应原文、译文和术语操作。</p>`;return}
+  if(syncReview){panel.innerHTML=`<div class="ppt-editor-heading"><b>同步后 Word 校验</b><span>只读</span></div><label>原文<div class="source" style="max-height:180px;overflow:auto">${esc(selected.source_text)}</div></label><label>当前译文<div class="source" style="max-height:260px;overflow:auto">${esc(selected.human_text??selected.machine_text??'')}</div></label><p>此阶段用于检查 PPT 图片替换后的版面。若需修改正文译文，请返回原 Word 校对版本修改后重新执行图片更新。</p>`;return}
   panel.innerHTML=`<div class="ppt-editor-heading"><b>Word 文本校对</b><span>${esc(selected.status)}</span></div><label>原文<div class="source" style="max-height:180px;overflow:auto">${esc(selected.source_text)}</div></label><label>译文<textarea id="word-unit-text" rows="12" maxlength="20000">${esc(selected.human_text??selected.machine_text??'')}</textarea></label><div class="ppt-assist-actions"><button id="word-unit-save">保存修改</button><button id="word-unit-confirm" class="primary">确认并写入翻译记忆</button><button id="word-add-glossary">加入全局术语库</button></div><div id="word-glossary-form"></div><small>术语请填写词或短语；整段内容应保存为译文或确认到翻译记忆。</small>`;
   $('#word-unit-save').onclick=()=>saveWordUnit(false);
   $('#word-unit-confirm').onclick=()=>saveWordUnit(true);
@@ -143,7 +178,13 @@ function installPreviewWheelNavigation(preview){
   // A small accumulated threshold prevents touchpads from turning one gesture
   // into several page changes. Editing controls keep their native scroll/input.
   preview.addEventListener('wheel',event=>{
-    if(reviewSaving || event.ctrlKey || event.target.closest('.ppt-editor, textarea, input, select, button'))return;
+    if(event.ctrlKey){
+      event.preventDefault();
+      const direction=event.deltaY<0?1:-1;
+      const next=Math.min(2.5,Math.max(.5,Math.round((currentReviewZoom()+direction*.1)*10)/10));
+      reviewZoomByPage.set(reviewZoomKey(),next);applyReviewZoom(preview);return;
+    }
+    if(reviewSaving || event.target.closest('.ppt-editor, textarea, input, select, button'))return;
     event.preventDefault();
     reviewWheelDelta += event.deltaY;
     if(reviewWheelLock || Math.abs(reviewWheelDelta)<70)return;
