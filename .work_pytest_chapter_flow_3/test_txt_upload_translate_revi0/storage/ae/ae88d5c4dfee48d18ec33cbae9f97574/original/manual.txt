@@ -1,0 +1,2 @@
+Start the motor 24 V
+Stop the motor
