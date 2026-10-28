@@ -4,7 +4,7 @@
 
 ## 启动
 
-首次双击 `Setup-SITRAIN.bat` 安装隔离依赖，之后双击 `Start-SITRAIN.bat`。浏览器会打开 `http://127.0.0.1:8080`。停止时运行 `Stop-SITRAIN.ps1`，或在服务窗口按 `Ctrl+C`。
+开发机首次双击 `Setup-SITRAIN.bat` 安装隔离依赖，之后双击 `Start-SITRAIN.bat`。浏览器会打开 `http://127.0.0.1:9000`。停止时运行 `Stop-SITRAIN.ps1`，或在服务窗口按 `Ctrl+C`。无需预装 Python 的教师绿色版构建与分发见 [教师绿色版试用](docs/teacher_portable.md)。
 
 数据默认保存在 `sitrain_data/`：SQLite 数据库、不可变原件、内部工作副本、管线中间文件和发布版本彼此分离。可以用 `SITRAIN_DATA_ROOT` 指向其他数据盘。
 

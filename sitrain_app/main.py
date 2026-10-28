@@ -30,6 +30,7 @@ from .providers import ProviderError, TranslationRequest, translate
 from .storage import checksum, file_dir, save_upload
 from .sync import _latest, apply_sync, create_mappings
 from .terminology import normalize
+from .teacher_config import configure_teacher_provider
 
 STATIC = Path(__file__).parent/"static"
 SOURCE_LANGUAGES = {"auto", "Chinese", "English", "German", "French", "Italian", "Spanish"}
@@ -39,6 +40,7 @@ TARGET_LANGUAGES = {"Chinese", "English"}
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_data_dirs(); db.init_db()
+    configure_teacher_provider()
     for task in db.rows("""SELECT t.id FROM tasks t LEFT JOIN files f ON f.id=t.file_id
                          WHERE t.status='queued' AND t.task_type='translate' AND f.project_id IS NULL"""):
         schedule_translation(task["id"])

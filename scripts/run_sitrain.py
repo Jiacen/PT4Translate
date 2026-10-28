@@ -9,12 +9,14 @@ from pathlib import Path
 
 import uvicorn
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
 PORT = int(os.getenv("SITRAIN_PORT", "9000"))
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
-(ROOT / "sitrain_data").mkdir(exist_ok=True)
-(ROOT / "sitrain_data" / "server.pid").write_text(str(os.getpid()), encoding="ascii")
+from sitrain_app.main import app
+data_root = Path(os.getenv("SITRAIN_DATA_ROOT", ROOT / "sitrain_data"))
+data_root.mkdir(parents=True, exist_ok=True)
+(data_root / "server.pid").write_text(str(os.getpid()), encoding="ascii")
 
 
 def open_browser():
@@ -23,4 +25,4 @@ def open_browser():
 
 
 threading.Thread(target=open_browser, daemon=True).start()
-uvicorn.run("sitrain_app.main:app", host="127.0.0.1", port=PORT, reload=False)
+uvicorn.run(app, host="127.0.0.1", port=PORT, reload=False)

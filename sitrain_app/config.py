@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_ROOT = Path(os.getenv("SITRAIN_DATA_ROOT", ROOT / "sitrain_data")).resolve()
+PORTABLE_ROOT = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else ROOT
+DATA_ROOT = Path(os.getenv("SITRAIN_DATA_ROOT", PORTABLE_ROOT / "sitrain_data")).resolve()
 DB_PATH = DATA_ROOT / "sitrain.db"
 STORAGE_ROOT = DATA_ROOT / "storage"
 MAX_UPLOAD_BYTES = int(os.getenv("SITRAIN_MAX_UPLOAD_BYTES", 512 * 1024 * 1024))

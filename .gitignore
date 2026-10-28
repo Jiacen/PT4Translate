@@ -58,6 +58,9 @@ mock_data/
 webapp/static/vad/*.wasm
 webapp/static/vad/*.onnx
 /dist/
+/teacher_packages/
+/build_portable*/
+tests/_portable_*/
 /build/
 /dist_models/
 /data/_archive/
