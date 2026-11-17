@@ -6,3 +6,5 @@ uvicorn>=0.30
 python-multipart>=0.0.9
 # Real-time voice translation (Gemini Live) proxy
 websockets>=12
+# Offline teacher manual rendering during portable ZIP packaging.
+markdown-it-py>=4.2

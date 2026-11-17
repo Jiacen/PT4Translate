@@ -68,6 +68,15 @@ def test_package_import_creates_chapters_and_pairs_by_filename(client, tmp_path)
     assert sorted(file["kind"] for files in chapters.values() for file in files) == ["powerpoint", "word", "word"]
 
 
+def test_paired_chapter_without_word_images_needs_no_sync(monkeypatch):
+    monkeypatch.setattr(db, "row", lambda *_args, **_kwargs: None)
+    files = [{"kind": "word", "status": "published", "preflight": {"images": 0}, "id": "word"},
+             {"kind": "powerpoint", "status": "published", "id": "ppt"}]
+    assert main._chapter_sync_gate("chapter", files) is None
+    files[0]["preflight"]["images"] = 1
+    assert main._chapter_sync_gate("chapter", files)["code"] == "mapping"
+
+
 def test_project_requires_structure_confirmation_and_releases_one_chapter(client, monkeypatch):
     project = client.post("/api/projects", json={"name": "章节队列", "description": ""}).json()
     first = client.post(f"/api/projects/{project['id']}/chapters", json={"name": "第一章"}).json()

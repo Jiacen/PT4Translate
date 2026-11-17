@@ -10,10 +10,36 @@ import sqlite3
 import sys
 import tempfile
 import zipfile
+from html import escape
 from pathlib import Path
 from urllib.parse import urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _teacher_manual() -> tuple[str, list[tuple[Path, str]]]:
+    """Render the checked-in teacher guide as an offline, pictured HTML page."""
+    from markdown_it import MarkdownIt
+
+    source = ROOT / "docs" / "teacher_user_manual.md"
+    markdown = source.read_text(encoding="utf-8")
+    pictures = []
+    for relative in set(re.findall(r"!\[[^\]]*\]\((images/[^)]+)\)", markdown)):
+        path = (source.parent / relative).resolve()
+        if not path.is_file() or source.parent.resolve() not in path.parents:
+            raise ValueError(f"手册图片不存在或路径无效：{relative}")
+        pictures.append((path, relative))
+    body = MarkdownIt("commonmark", {"html": False}).render(markdown)
+    style = """body{font:16px/1.75 'Microsoft YaHei','Segoe UI',sans-serif;color:#173033;background:#f2f6f6;margin:0}
+main{max-width:940px;margin:32px auto;padding:44px 58px;background:#fff;box-shadow:0 8px 35px #1234}
+h1,h2,h3{line-height:1.35;color:#073e43}h1{font-size:30px}h2{margin-top:42px;border-bottom:2px solid #007c83;padding-bottom:8px}
+img{max-width:100%;height:auto;display:block;margin:18px auto 6px;border:1px solid #d9e3e4}
+code{background:#edf5f5;padding:2px 5px;overflow-wrap:anywhere}li{margin:8px 0}a{color:#007c83}
+blockquote{border-left:4px solid #007c83;padding:4px 18px;background:#edf7f7;margin:18px 0}
+@media(max-width:700px){main{margin:0;padding:18px}body{font-size:15px}}@media print{body{background:#fff}main{margin:0;padding:0;box-shadow:none}img{break-inside:avoid}h2{break-after:avoid}}"""
+    html = f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape("SITRAIN 教师绿色版使用手册")}</title><style>{style}</style></head><body><main>{body}</main></body></html>'
+    return html, sorted(pictures, key=lambda item: item[1])
 
 
 def _read_active_provider(source_db: Path) -> dict:
@@ -87,6 +113,7 @@ def issue(runtime: Path, destination: Path, teachers: list[str], relay_url: str 
         # This file is for the relay host only. Never place it inside a ZIP.
         (destination / "relay-tokens.SERVER-ONLY.json").write_text(json.dumps(tokens, indent=2), encoding="utf-8")
     provider = _read_active_provider(source_db) if source_db else None
+    manual_html, manual_pictures = _teacher_manual()
     seed_path = None
     try:
         if provider:
@@ -105,8 +132,12 @@ def issue(runtime: Path, destination: Path, teachers: list[str], relay_url: str 
                     archive.writestr("SITRAIN-Teacher/teacher-config.json", json.dumps({"relay_url": url, "access_token": tokens[name]}, ensure_ascii=False))
                 else:
                     archive.writestr("SITRAIN-Teacher/sitrain_data/sitrain.db", seed_db)
+                archive.writestr("SITRAIN-Teacher/使用手册.html", manual_html)
+                for picture, relative in manual_pictures:
+                    archive.write(picture, "SITRAIN-Teacher/" + relative)
                 archive.writestr("SITRAIN-Teacher/使用说明.txt",
                                  "解压整个 SITRAIN-Teacher 文件夹，双击 SITRAIN-Teacher.exe。\n"
+                                 "首次使用请双击同目录的 使用手册.html，按图文步骤从启动走到交付。\n"
                                  "浏览器地址：http://127.0.0.1:9000/\n"
                                  "请保留整个文件夹；教材与校对记录保存在其中的 sitrain_data 子目录。\n"
                                  "更新程序前，请先备份整个 sitrain_data 目录。\n")

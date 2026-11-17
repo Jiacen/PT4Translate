@@ -158,6 +158,9 @@ def _chapter_sync_gate(chapter_id: str, files: list[dict]) -> dict | None:
     ppt = next((file for file in files if file["kind"] == "powerpoint"), None)
     if not word or not ppt or word["status"] != "published" or ppt["status"] != "published":
         return None
+    # A paired Word without embedded pictures has nothing to synchronize.
+    if (word.get("preflight") or {}).get("images") == 0:
+        return None
     sync = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1",
                   (word["id"],))
     if not sync:

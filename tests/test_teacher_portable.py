@@ -34,6 +34,9 @@ def test_teacher_package_contains_clean_seed_only(tmp_path):
         with zipfile.ZipFile(package) as archive:
             names = archive.namelist()
             assert "SITRAIN-Teacher/sitrain_data/sitrain.db" in names
+            assert "SITRAIN-Teacher/使用手册.html" in names
+            assert "SITRAIN-Teacher/images/01-welcome.png" in names
+            assert "教师绿色版 Pilot 使用手册" in archive.read("SITRAIN-Teacher/使用手册.html").decode("utf-8")
             assert not any("teacher-config.json" in name for name in names)
             assert not any("local-testing-material.docx" in name or "system_config.json" in name for name in names)
             seeded = tmp_path / (package.stem + ".db")
