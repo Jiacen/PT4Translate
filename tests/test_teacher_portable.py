@@ -35,6 +35,8 @@ def test_teacher_package_contains_clean_seed_only(tmp_path):
             names = archive.namelist()
             assert "SITRAIN-Teacher/sitrain_data/sitrain.db" in names
             assert "SITRAIN-Teacher/使用手册.html" in names
+            assert "SITRAIN-Teacher/使用手册.pdf" in names
+            assert archive.read("SITRAIN-Teacher/使用手册.pdf").startswith(b"%PDF-")
             assert "SITRAIN-Teacher/images/01-welcome.png" in names
             assert "教师绿色版 Pilot 使用手册" in archive.read("SITRAIN-Teacher/使用手册.html").decode("utf-8")
             assert not any("teacher-config.json" in name for name in names)

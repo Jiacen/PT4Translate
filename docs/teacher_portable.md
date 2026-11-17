@@ -2,9 +2,9 @@
 
 教师端是 Windows 绿色文件夹。老师解压后双击 `SITRAIN-Teacher.exe`，浏览器打开 `http://127.0.0.1:9000/`。需已安装 Microsoft Office；翻译需要联网。教材、校对和发布文件保存在同一文件夹下的 `sitrain_data/`，更新程序前必须备份该目录。
 
-面向老师的完整操作步骤已写入 [教师绿色版 Pilot 使用手册](teacher_user_manual.md)，可直接打开[离线图文版](teacher_user_manual.html)预览。
+面向老师的完整操作步骤已写入 [教师绿色版 Pilot 使用手册 PDF](teacher_user_manual.pdf)，也可打开[离线网页版](teacher_user_manual.html)预览。
 
-Pilot 发包时，ZIP 内自带可离线打开的 `使用手册.html` 和配套截图。老师先解压整个文件夹，再双击手册阅读；不要单独移动手册或图片目录。
+Pilot 发包时，ZIP 内自带可离线打开的 `使用手册.pdf`。老师先解压整个文件夹，再打开 PDF 按步骤操作。ZIP 也保留 `使用手册.html` 和配套截图，便于在浏览器中阅读。
 
 ## 构建运行包
 

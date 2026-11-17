@@ -37,7 +37,9 @@ h1,h2,h3{line-height:1.35;color:#073e43}h1{font-size:30px}h2{margin-top:42px;bor
 img{max-width:100%;height:auto;display:block;margin:18px auto 6px;border:1px solid #d9e3e4}
 code{background:#edf5f5;padding:2px 5px;overflow-wrap:anywhere}li{margin:8px 0}a{color:#007c83}
 blockquote{border-left:4px solid #007c83;padding:4px 18px;background:#edf7f7;margin:18px 0}
-@media(max-width:700px){main{margin:0;padding:18px}body{font-size:15px}}@media print{body{background:#fff}main{margin:0;padding:0;box-shadow:none}img{break-inside:avoid}h2{break-after:avoid}}"""
+@media(max-width:700px){main{margin:0;padding:18px}body{font-size:15px}}
+@page{size:A4;margin:15mm 13mm 17mm;@bottom-center{content:counter(page);font:9pt 'Segoe UI';color:#66777a}}
+@media print{body{background:#fff}main{margin:0;padding:0;box-shadow:none}img{break-inside:avoid}h2{break-after:avoid}}"""
     html = f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{escape("SITRAIN 教师绿色版使用手册")}</title><style>{style}</style></head><body><main>{body}</main></body></html>'
     return html, sorted(pictures, key=lambda item: item[1])
 
@@ -114,6 +116,9 @@ def issue(runtime: Path, destination: Path, teachers: list[str], relay_url: str 
         (destination / "relay-tokens.SERVER-ONLY.json").write_text(json.dumps(tokens, indent=2), encoding="utf-8")
     provider = _read_active_provider(source_db) if source_db else None
     manual_html, manual_pictures = _teacher_manual()
+    manual_pdf = ROOT / "docs" / "teacher_user_manual.pdf"
+    if not manual_pdf.is_file() or not manual_pdf.read_bytes().startswith(b"%PDF-"):
+        raise ValueError("请先生成 docs/teacher_user_manual.pdf")
     seed_path = None
     try:
         if provider:
@@ -133,11 +138,12 @@ def issue(runtime: Path, destination: Path, teachers: list[str], relay_url: str 
                 else:
                     archive.writestr("SITRAIN-Teacher/sitrain_data/sitrain.db", seed_db)
                 archive.writestr("SITRAIN-Teacher/使用手册.html", manual_html)
+                archive.write(manual_pdf, "SITRAIN-Teacher/使用手册.pdf")
                 for picture, relative in manual_pictures:
                     archive.write(picture, "SITRAIN-Teacher/" + relative)
                 archive.writestr("SITRAIN-Teacher/使用说明.txt",
                                  "解压整个 SITRAIN-Teacher 文件夹，双击 SITRAIN-Teacher.exe。\n"
-                                 "首次使用请双击同目录的 使用手册.html，按图文步骤从启动走到交付。\n"
+                                 "首次使用请打开同目录的 使用手册.pdf，按图文步骤从启动走到交付。\n"
                                  "浏览器地址：http://127.0.0.1:9000/\n"
                                  "请保留整个文件夹；教材与校对记录保存在其中的 sitrain_data 子目录。\n"
                                  "更新程序前，请先备份整个 sitrain_data 目录。\n")
