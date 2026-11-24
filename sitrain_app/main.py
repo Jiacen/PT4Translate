@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import io
 import os
@@ -27,7 +28,7 @@ from .pipeline import (add_version, auto_repair_missing_terms, confirm_manual_te
                        revalidate_terminology_qa, run_translation, schedule_project_translation,
                        schedule_translation, start_automatic_translation, start_project_translation)
 from .providers import ProviderError, TranslationRequest, translate
-from .storage import checksum, file_dir, save_upload
+from .storage import checksum, file_dir, safe_filename, save_upload, upload_checksum
 from .sync import _latest, apply_sync, create_mappings
 from .terminology import normalize
 from .teacher_config import configure_teacher_provider
@@ -39,6 +40,9 @@ TARGET_LANGUAGES = {"Chinese", "English"}
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # One lock per server lifespan/event loop. Release it before Office
+    # preflight runs; only the import's check-and-save sequence is serialized.
+    _app.state.package_import_lock = asyncio.Lock()
     ensure_data_dirs(); db.init_db()
     configure_teacher_provider()
     for task in db.rows("""SELECT t.id FROM tasks t LEFT JOIN files f ON f.id=t.file_id
@@ -341,6 +345,14 @@ async def package_import(project_id: str, background: BackgroundTasks,
                          word_files: list[UploadFile] = File(default=[]),
                          ppt_files: list[UploadFile] = File(default=[]),
                          source_language: str = Form("auto"), target_language: str = Form("Chinese")):
+    async with app.state.package_import_lock:
+        return await _import_package(project_id, background, word_files, ppt_files,
+                                     source_language, target_language)
+
+
+async def _import_package(project_id: str, background: BackgroundTasks,
+                          word_files: list[UploadFile], ppt_files: list[UploadFile],
+                          source_language: str, target_language: str):
     if not db.row("SELECT id FROM projects WHERE id=?", (project_id,)):
         raise HTTPException(404, "教材项目不存在")
     if not word_files and not ppt_files:
@@ -349,7 +361,6 @@ async def package_import(project_id: str, background: BackgroundTasks,
         raise HTTPException(422, "语言设置无效")
     if source_language != "auto" and source_language == target_language:
         raise HTTPException(422, "源语言与目标语言不能相同")
-    db.execute("UPDATE projects SET workflow_status='structure_review',updated_at=? WHERE id=?", (db.utcnow(), project_id))
     incoming = [("word", upload) for upload in word_files] + [("ppt", upload) for upload in ppt_files]
     keys: dict[str, dict[str, list[UploadFile]]] = {}
     for family, upload in incoming:
@@ -362,20 +373,55 @@ async def package_import(project_id: str, background: BackgroundTasks,
     duplicates = [key for key, group in keys.items() if len(group["word"]) > 1 or len(group["ppt"]) > 1]
     if duplicates:
         raise HTTPException(409, f"发现同一栏目中的重复章节文件：{', '.join(duplicates[:5])}")
+
+    # A second click, a retry after a lost response, or a later re-import must
+    # reuse the same original. Check project-wide so manual chapter moves and
+    # renaming cannot accidentally turn an unchanged file into a new task.
+    originals = db.rows("""SELECT f.*, v.checksum AS original_checksum FROM files f
+                         LEFT JOIN file_versions v ON v.file_id=f.id AND v.version_type='original'
+                         WHERE f.project_id=? ORDER BY f.created_at""", (project_id,))
+    by_name: dict[str, list[dict]] = {}
+    for file in originals:
+        by_name.setdefault(file["original_name"].casefold(), []).append(file)
+    pending, skipped = [], []
+    reused_chapters = {}
+    for family, upload in incoming:
+        name = safe_filename(upload.filename or "upload")
+        candidates = by_name.get(name.casefold(), [])
+        if not candidates:
+            pending.append((family, upload))
+            continue
+        digest = await upload_checksum(upload)
+        match = next((file for file in candidates
+                      if file["original_checksum"] == digest
+                      and file["source_language"] == source_language
+                      and file["target_language"] == target_language), None)
+        if not match:
+            raise HTTPException(409, f"项目中已存在同名文件“{name}”，但内容或翻译语言不同。"
+                                "本次未导入任何文件，也未覆盖原件；请核对后更换文件名或新建项目。")
+        skipped.append({"id": match["id"], "chapter": match["chapter_id"], "family": family, "name": name})
+        reused_chapters[_chapter_key(upload.filename or "")] = match["chapter_id"]
+
     existing = { _chapter_key(chapter["name"]): chapter for chapter in db.rows("SELECT * FROM chapters WHERE project_id=?", (project_id,)) }
     created: dict[str, str] = {}
-    for key, group in keys.items():
+    chapters_created = 0
+    for key in dict.fromkeys(_chapter_key(upload.filename or "") for _, upload in pending):
+        group = keys[key]
+        if reused_chapters.get(key):
+            created[key] = reused_chapters[key]
+            continue
         chapter = existing.get(key)
         if not chapter:
             label = Path((group["word"] or group["ppt"])[0].filename or key).stem
             pos = db.scalar("SELECT COALESCE(MAX(position),-1)+1 FROM chapters WHERE project_id=?", (project_id,))
             chapter_id, now = db.new_id(), db.utcnow()
             db.execute("INSERT INTO chapters(id,project_id,name,position,created_at,updated_at) VALUES(?,?,?,?,?,?)", (chapter_id, project_id, label, pos, now, now))
+            chapters_created += 1
         else:
             chapter_id = chapter["id"]
         created[key] = chapter_id
     saved = []
-    for family, upload in incoming:
+    for family, upload in pending:
         key, fid, now = _chapter_key(upload.filename or ""), db.new_id(), db.utcnow()
         path = await save_upload(upload, fid)
         ext = path.suffix.lower()
@@ -384,9 +430,10 @@ async def package_import(project_id: str, background: BackgroundTasks,
         add_version(fid, "original", path, {"immutable": True, "package_family": family})
         background.add_task(prepare_file, fid)
         saved.append({"id": fid, "chapter": created[key], "family": family, "name": path.name})
-    db.execute("UPDATE projects SET updated_at=? WHERE id=?", (db.utcnow(), project_id))
+    if saved:
+        db.execute("UPDATE projects SET workflow_status='structure_review',updated_at=? WHERE id=?", (db.utcnow(), project_id))
     paired = sum(1 for group in keys.values() if group["word"] and group["ppt"])
-    return {"files": saved, "chapters_created": len(created), "paired_chapters": paired,
+    return {"files": saved, "skipped_files": skipped, "chapters_created": chapters_created, "paired_chapters": paired,
             "word_only": sum(1 for group in keys.values() if group["word"] and not group["ppt"]),
             "ppt_only": sum(1 for group in keys.values() if group["ppt"] and not group["word"])}
 

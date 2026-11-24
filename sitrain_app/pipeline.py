@@ -11,6 +11,7 @@ from . import db
 from .documents import (TRANSLATE_OFFICE_IMAGE_TEXT, convert_legacy, document_page_count,
                         extract_units, preflight, prepare_preview_cache, rebuild)
 from .providers import TranslationRequest, translate
+from .ppt_fidelity import paragraph_line_groups
 from .storage import checksum, file_dir
 from .review_versions import serialized
 from .terminology import Term, TerminologyEngine, normalize, residual_source_issues
@@ -256,7 +257,8 @@ def _retry_missing_terms(provider: dict, file: dict, engine: TerminologyEngine,
     if not retry_units:
         return translations, 0
     retried = translate(provider, TranslationRequest(retry_units, file["source_language"], file["target_language"],
-                                                     term_records, memory), progress)
+                                                     term_records, memory, preserve_line_breaks=file.get("kind") == "powerpoint",
+                                                     line_groups={u["stable_key"]: paragraph_line_groups(u.get("source_payload") or {}) for u in units}), progress)
     fixed = dict(translations)
     repaired = 0
     by_key = {unit["stable_key"]: unit for unit in units}
@@ -372,7 +374,8 @@ def run_translation(task_id: str, provider_id: str | None = None) -> None:
         pending, protected_map, direct = [],{},{}
         tm = {m["source_norm"]:m["target"] for m in db.rows("SELECT source_norm,target FROM translation_memory WHERE project_id IS ?",(file.get("project_id"),))}
         for unit in units:
-            if normalize(unit["source_text"]) in tm:
+            remembered = tm.get(normalize(unit["source_text"]))
+            if remembered is not None and (file.get("kind") != "powerpoint" or all(remembered.count(c) == unit["source_text"].count(c) for c in ('\n', '\t'))):
                 direct[unit["stable_key"]] = tm[normalize(unit["source_text"])]
                 continue
             text,mapping = engine.protect(unit["source_text"])
@@ -380,7 +383,9 @@ def run_translation(task_id: str, provider_id: str | None = None) -> None:
             protected_map[unit["stable_key"]] = mapping
         def progress(done,total):
             db.execute("UPDATE tasks SET progress=?,detail=?,updated_at=? WHERE id=?",(0.05+0.8*(done/max(1,total)),f"已翻译 {done}/{total}",db.utcnow(),task_id))
-        result = direct | (translate(provider,TranslationRequest(pending,file["source_language"],file["target_language"],term_records,memory),progress) if pending else {})
+        result = direct | (translate(provider,TranslationRequest(pending,file["source_language"],file["target_language"],term_records,memory,
+                            preserve_line_breaks=file.get("kind") == "powerpoint",
+                            line_groups={u["stable_key"]: paragraph_line_groups(u.get("source_payload") or {}) for u in units}),progress) if pending else {})
         def repair_progress(done, total):
             db.execute("UPDATE tasks SET progress=?,detail=?,updated_at=? WHERE id=?",
                        (0.88 + 0.07 * (done / max(1, total)), f"正在自动修正术语 {done}/{total}", db.utcnow(), task_id))

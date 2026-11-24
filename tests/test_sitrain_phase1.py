@@ -68,6 +68,124 @@ def test_package_import_creates_chapters_and_pairs_by_filename(client, tmp_path)
     assert sorted(file["kind"] for files in chapters.values() for file in files) == ["powerpoint", "word", "word"]
 
 
+@pytest.fixture()
+def import_pair(monkeypatch):
+    from docx import Document
+    from pptx import Presentation
+
+    word, ppt = io.BytesIO(), io.BytesIO()
+    document = Document()
+    document.add_paragraph("Configuration and commissioning")
+    document.save(word)
+    Presentation().save(ppt)
+    prepared = []
+    monkeypatch.setattr(main, "prepare_file", prepared.append)
+    return [
+        ("word_files", ("01_DR-G220_Configuration.docx", word.getvalue())),
+        ("ppt_files", ("01_DR-G220_Configuration.pptx", ppt.getvalue())),
+    ], prepared
+
+
+@pytest.mark.parametrize("concurrent", [False, True])
+def test_package_import_retry_keeps_one_pair(client, import_pair, monkeypatch, concurrent):
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    files, prepared = import_pair
+    project = client.post("/api/projects", json={"name": "重复导入回归"}).json()
+    url = f"/api/projects/{project['id']}/package-import"
+    save = main.save_upload
+
+    async def delayed_save(*args):
+        # Force two concurrent requests to overlap while writing their files.
+        await asyncio.sleep(0.02)
+        return await save(*args)
+
+    monkeypatch.setattr(main, "save_upload", delayed_save)
+    if concurrent:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(client.post, url, files=files) for _ in range(2)]
+            responses = [future.result() for future in futures]
+    else:
+        responses = [client.post(url, files=files) for _ in range(2)]
+    assert [response.status_code for response in responses] == [200, 200]
+    detail = client.get(f"/api/projects/{project['id']}").json()
+    assert len(detail["chapters"]) == 1
+    assert len(detail["chapters"][0]["files"]) == 2
+    assert sorted(len(response.json()["files"]) for response in responses) == [0, 2]
+    assert sorted(len(response.json()["skipped_files"]) for response in responses) == [0, 2]
+    assert len(prepared) == 2
+    assert db.scalar("SELECT COUNT(*) FROM file_versions") == 2
+    assert len(list(storage.STORAGE_ROOT.glob("*/*/original/*"))) == 2
+
+
+def test_package_import_retry_preserves_confirmed_structure_and_files(client, import_pair):
+    files, prepared = import_pair
+    project = client.post("/api/projects", json={"name": "保留已确认结构"}).json()
+    url = f"/api/projects/{project['id']}/package-import"
+    original = client.post(url, files=files).json()["files"]
+    chapter_id = original[0]["chapter"]
+    db.execute("UPDATE chapters SET name='教师调整后的章节' WHERE id=?", (chapter_id,))
+    db.execute("UPDATE files SET status='published' WHERE project_id=?", (project["id"],))
+    db.execute("UPDATE projects SET workflow_status='waiting_start' WHERE id=?", (project["id"],))
+    response = client.post(url, files=files)
+    assert response.status_code == 200, response.text
+    assert {file["id"] for file in response.json()["skipped_files"]} == {file["id"] for file in original}
+    detail = client.get(f"/api/projects/{project['id']}").json()
+    assert detail["workflow_status"] == "waiting_start"
+    assert len(detail["chapters"]) == 1
+    assert detail["chapters"][0]["name"] == "教师调整后的章节"
+    assert {file["status"] for file in detail["chapters"][0]["files"]} == {"published"}
+    assert len(prepared) == 2
+
+
+@pytest.mark.parametrize("conflict", ["content", "language"])
+def test_package_import_same_name_conflict_does_not_append_or_overwrite(client, import_pair, conflict):
+    from docx import Document
+
+    files, prepared = import_pair
+    project = client.post("/api/projects", json={"name": "同名冲突回归"}).json()
+    url = f"/api/projects/{project['id']}/package-import"
+    client.post(url, files=files)
+    before = db.rows("SELECT * FROM file_versions ORDER BY id")
+    db.execute("UPDATE projects SET workflow_status='waiting_start' WHERE id=?", (project["id"],))
+    new_files = list(files)
+    data = {}
+    if conflict == "content":
+        changed = io.BytesIO()
+        document = Document()
+        document.add_paragraph("Changed source material")
+        document.save(changed)
+        new_files[0] = ("word_files", (files[0][1][0], changed.getvalue()))
+    else:
+        data = {"target_language": "English"}
+    # A conflict must be detected before even unrelated new files are added.
+    new_files.insert(0, ("word_files", ("00_Cover.docx", files[0][1][1])))
+    response = client.post(url, files=new_files, data=data)
+    assert response.status_code == 409, response.text
+    assert "同名" in response.json()["detail"]
+    assert db.rows("SELECT * FROM file_versions ORDER BY id") == before
+    assert db.scalar("SELECT COUNT(*) FROM files") == 2
+    assert db.scalar("SELECT COUNT(*) FROM chapters") == 1
+    assert db.row("SELECT workflow_status FROM projects WHERE id=?", (project["id"],))["workflow_status"] == "waiting_start"
+    assert len(prepared) == 2
+
+
+def test_package_import_adds_missing_companion_and_isolates_projects(client, import_pair):
+    files, prepared = import_pair
+    project = client.post("/api/projects", json={"name": "补充配套文件"}).json()
+    url = f"/api/projects/{project['id']}/package-import"
+    first = client.post(url, files=files[:1]).json()
+    second = client.post(url, files=files).json()
+    assert len(second["files"]) == len(second["skipped_files"]) == 1
+    assert second["files"][0]["chapter"] == first["files"][0]["chapter"]
+    other = client.post("/api/projects", json={"name": "另一教材项目"}).json()
+    independent = client.post(f"/api/projects/{other['id']}/package-import", files=files).json()
+    assert len(independent["files"]) == 2
+    assert independent["skipped_files"] == []
+    assert len(prepared) == 4
+
+
 def test_paired_chapter_without_word_images_needs_no_sync(monkeypatch):
     monkeypatch.setattr(db, "row", lambda *_args, **_kwargs: None)
     files = [{"kind": "word", "status": "published", "preflight": {"images": 0}, "id": "word"},
@@ -163,6 +281,38 @@ def test_pptx_roundtrip_uses_linguaharu_kernel(client, tmp_path):
     assert output_shape.text_frame.paragraphs[0].runs[0].font.size == Pt(24)
     preview = client.get(f"/api/files/{fid}/preview/1")
     assert preview.status_code == 200 and preview.headers["content-type"].startswith("image/png")
+
+
+def test_ppt_translation_pipeline_preserves_title_breaks_and_rejects_flattened_memory(client, tmp_path, monkeypatch):
+    from pptx import Presentation
+    from pptx.oxml.xmlchemy import OxmlElement
+    from pptx.util import Inches, Pt
+    from sitrain_app.terminology import normalize
+
+    monkeypatch.setattr(pipeline, "prepare_preview_cache", lambda *args: None)
+    source = tmp_path / 'title.pptx'
+    deck = Presentation()
+    slide = deck.slides.add_slide(deck.slide_layouts[6])
+    box = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(6), Inches(2))
+    paragraph = box.text_frame.paragraphs[0]
+    first = paragraph.add_run(); first.text = 'Step 1'; first.font.size = Pt(28); first.font.bold = True
+    paragraph._p.append(OxmlElement('a:br'))
+    second = paragraph.add_run(); second.text = 'Control panel'; second.font.size = Pt(18); second.font.bold = False
+    deck.save(source)
+    db.execute("INSERT INTO translation_memory(id,source_norm,source,target,approved_at) VALUES(?,?,?,?,?)",
+               (db.new_id(), normalize('Step 1\nControl panel'), 'Step 1\nControl panel', '步骤1控制面板', db.utcnow()))
+    with source.open('rb') as stream:
+        response = client.post('/api/files/upload', files={'upload': (source.name, stream)})
+    assert response.status_code == 200, response.text
+    fid = response.json()['id']
+    units = client.get(f'/api/files/{fid}/units').json()['units']
+    unit = next(unit for unit in units if unit['source_text'] == 'Step 1\nControl panel')
+    assert unit['machine_text'] == '[机翻]Step 1\n[机翻]Control panel'
+    version = db.row("SELECT path FROM file_versions WHERE file_id=? AND version_type='machine'", (fid,))
+    translated = Presentation(version['path']).slides[0].shapes[0].text_frame.paragraphs[0]
+    assert translated.text == '[机翻]Step 1\v[机翻]Control panel'
+    assert [run.font.size for run in translated.runs] == [Pt(28), Pt(18)]
+    assert [run.font.bold for run in translated.runs] == [True, False]
 
 
 def test_server_rejects_disallowed_extension(client):

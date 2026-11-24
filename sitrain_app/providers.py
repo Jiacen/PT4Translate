@@ -7,10 +7,12 @@ import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import requests
+
+from .ppt_fidelity import restore_soft_breaks
 
 
 @dataclass
@@ -20,6 +22,8 @@ class TranslationRequest:
     target_lang: str
     terms: list[dict]
     memory: list[dict]
+    preserve_line_breaks: bool = False
+    line_groups: dict[str, list[int]] | None = None
 
 
 class ProviderError(RuntimeError):
@@ -173,6 +177,42 @@ def translate_openai(config: dict, request: TranslationRequest, progress: Callab
 
 
 def translate(config: dict, request: TranslationRequest, progress=lambda a,b:None) -> dict[str,str]:
+    if request.preserve_line_breaks and any('\n' in text or '\t' in text for _, text in request.units):
+        # Keep one database unit per authored paragraph, but translate its
+        # style groups independently. Uniformly styled sentences keep their
+        # context across a soft break; headings and smaller details stay apart.
+        flattened, segments_by_key = [], {}
+        for ordinal, (key, text) in enumerate(request.units):
+            segments = []
+            lines = text.split('\n')
+            groups = (request.line_groups or {}).get(key) or [1] * len(lines)
+            if sum(groups) != len(lines):
+                groups = [1] * len(lines)
+            offset = 0
+            for group_index, count in enumerate(groups):
+                source_lines = lines[offset:offset+count]
+                group_text = '\n'.join(source_lines)
+                if group_index:
+                    segments.append(('', '\n', None))
+                if count > 1 and '\t' not in group_text and all(line.strip() for line in source_lines):
+                    line_key = f"line:{ordinal}:{group_index}:group"
+                    segments.append((line_key, group_text, source_lines))
+                    flattened.append((line_key, ' '.join(source_lines)))
+                else:
+                    for index, line in enumerate(re.split(r'([\n\t])', group_text)):
+                        line_key = f"line:{ordinal}:{group_index}:{index}"
+                        segments.append((line_key, line, None))
+                        if line.strip():
+                            flattened.append((line_key, line))
+                offset += count
+            segments_by_key[key] = segments
+        translated = translate(config, replace(request, units=flattened, preserve_line_breaks=False), progress) if flattened else {}
+        if set(translated) != {key for key, _ in flattened}:
+            raise ProviderError("Provider 返回的 PPT 分行译文缺项或包含未知 ID")
+        return {key: ''.join(restore_soft_breaks(source_lines, translated[line_key]) if source_lines
+                            else re.sub(r'[\r\n\t]+', ' ', translated[line_key]) if line.strip() else line
+                            for line_key, line, source_lines in segments)
+                for key, segments in segments_by_key.items()}
     if config["protocol"] == "qwen_mt":
         return translate_qwen(config,request,progress)
     if config["protocol"] == "mock":

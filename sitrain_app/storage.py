@@ -37,6 +37,21 @@ def checksum(path: Path) -> str:
     return h.hexdigest()
 
 
+async def upload_checksum(upload: UploadFile) -> str:
+    """Compare a retry with the immutable original without saving another copy."""
+    h = hashlib.sha256()
+    size = 0
+    try:
+        while chunk := await upload.read(1024 * 1024):
+            size += len(chunk)
+            if size > MAX_UPLOAD_BYTES:
+                raise HTTPException(413, "文件超过上传大小限制")
+            h.update(chunk)
+    finally:
+        await upload.seek(0)
+    return h.hexdigest()
+
+
 async def save_upload(upload: UploadFile, file_id: str) -> Path:
     name = safe_filename(upload.filename or "upload")
     ext = Path(name).suffix.lower()

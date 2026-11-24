@@ -29,6 +29,7 @@ OFFICE_OCR_MIN_PIXELS = 80_000
 # screenshots intact by default: OCR/replacement makes the UI inaccurate and harms
 # the visual layout.  This is intentionally a server-side policy, not a user task.
 TRANSLATE_OFFICE_IMAGE_TEXT = False
+PPT_RENDER_CACHE_VERSION = "ppt-native-v2"
 
 
 def _get_ocr():
@@ -249,9 +250,12 @@ def _office_extract(path: Path, temp_dir: Path) -> tuple[Path, list[dict]]:
         page = item.get("slide_index") or item.get("page")
         if ext == ".xlsx":
             page = item.get("sheet")
+        source_text = str(item.get("value", ""))
+        if ext == ".pptx":
+            source_text = source_text.replace("␊", "\n").replace("␍", "\n")
         units.append({"stable_key":str(item["count_src"]),"page":page if isinstance(page,int) else None,
                       "object_ref":str(page or item.get("type", "")),"unit_type":item.get("type", "text"),
-                      "source_text":str(item.get("value", "")),"confidence":None,"source_payload":item})
+                      "source_text":source_text,"confidence":None,"source_payload":item})
     if TRANSLATE_OFFICE_IMAGE_TEXT:
         units.extend(_office_ocr_units(path,len(units)))
     return json_path, units
@@ -391,8 +395,11 @@ def rebuild(source: Path, source_json: Path | None, units: list[dict], result_di
         dst_json.write_text(json.dumps(translated,ensure_ascii=False,indent=2),encoding="utf-8")
         if ext == ".pptx":
             from core.pipelines.ppt_translation_pipeline import write_translated_content_to_ppt
-            output=Path(write_translated_content_to_ppt(str(source),str(source_json),str(dst_json),str(source_json.parent.parent),str(result_dir),source_lang,target_lang))
-            _apply_office_ocr(output,units); return output
+            from .ppt_fidelity import verify_pptx_preservation
+            output=Path(write_translated_content_to_ppt(str(source),str(source_json),str(dst_json),str(source_json.parent.parent),str(result_dir),source_lang,target_lang,preserve_formatting=True))
+            verify_pptx_preservation(source, output)
+            _apply_office_ocr(output, units)
+            return output
         if ext == ".docx":
             from core.pipelines.word_translation_pipeline import write_translated_content_to_word
             output=Path(write_translated_content_to_word(str(source),str(source_json),str(dst_json),str(source_json.parent.parent),str(result_dir),False,source_lang,target_lang))
@@ -444,14 +451,25 @@ def rebuild(source: Path, source_json: Path | None, units: list[dict], result_di
     return output
 
 
+def _ppt_render_command(source: Path, target: Path, page: str) -> list[str] | None:
+    if os.name != "nt":
+        return None
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--render-ppt-preview", str(source), str(target), page]
+    helper = Path(__file__).resolve().parent.parent / "scripts" / "render_ppt_preview.py"
+    if not helper.exists():
+        return None
+    return [sys.executable, str(helper), str(source), str(target), page]
+
+
 def _render_pptx_with_powerpoint(source: Path, page_number: int, target: Path) -> bool:
     """Use a short-lived helper: Office COM must not live in the web worker."""
-    helper = Path(__file__).resolve().parent.parent / "scripts" / "render_ppt_preview.py"
-    if not helper.exists() or os.name != "nt":
+    command = _ppt_render_command(source, target, str(page_number))
+    if command is None:
         return False
     try:
-        run = subprocess.run([sys.executable, str(helper), str(source), str(target), str(page_number)],
-                             capture_output=True, text=True, timeout=120, check=False)
+        run = subprocess.run(command, capture_output=True, text=True, timeout=120, check=False,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
         return False
     return run.returncode == 0 and target.exists() and target.stat().st_size > 0
@@ -459,12 +477,12 @@ def _render_pptx_with_powerpoint(source: Path, page_number: int, target: Path) -
 
 def _render_pptx_deck_with_powerpoint(source: Path, cache_dir: Path) -> bool:
     """Render every slide in one isolated Office process, not one process/page."""
-    helper = Path(__file__).resolve().parent.parent / "scripts" / "render_ppt_preview.py"
-    if not helper.exists() or os.name != "nt":
+    command = _ppt_render_command(source, cache_dir, "all")
+    if command is None:
         return False
     try:
-        run = subprocess.run([sys.executable, str(helper), str(source), str(cache_dir), "all"],
-                             capture_output=True, text=True, timeout=300, check=False)
+        run = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
         return False
     return run.returncode == 0 and (cache_dir / "page-1-rendered.png").exists()
@@ -521,6 +539,8 @@ def prepare_preview_cache(source: Path, cache_dir: Path, pages: int) -> None:
         return
     if source.suffix.lower() != ".pptx":
         return
+    cache_dir = cache_dir / PPT_RENDER_CACHE_VERSION
+    cache_dir.mkdir(parents=True, exist_ok=True)
     if all((cache_dir / f"page-{page}-rendered.png").exists() for page in range(1, pages + 1)):
         return
     if _render_pptx_deck_with_powerpoint(source, cache_dir):
@@ -548,10 +568,12 @@ def prepare_preview_cache(source: Path, cache_dir: Path, pages: int) -> None:
 
 def render_preview(source: Path, page_number: int, cache_dir: Path) -> Path:
     """Render one page without executing document macros or embedded links."""
+    ext=source.suffix.lower()
+    if ext == ".pptx":
+        cache_dir = cache_dir / PPT_RENDER_CACHE_VERSION
     cache_dir.mkdir(parents=True,exist_ok=True)
     target=cache_dir/f"page-{page_number}-rendered.png"
     if target.exists(): return target
-    ext=source.suffix.lower()
     if ext == ".pdf":
         import fitz
         doc=fitz.open(source)
@@ -567,28 +589,8 @@ def render_preview(source: Path, page_number: int, cache_dir: Path) -> Path:
         rendered = _render_pptx_with_libreoffice(source, page_number, cache_dir)
         if rendered:
             return rendered
-        # Last-resort preview for developer environments without a renderer.
-        # It is intentionally not used on a properly provisioned VPS.
-        try:
-            from pptx import Presentation
-            from pptx.enum.shapes import MSO_SHAPE_TYPE
-            deck=Presentation(source)
-            if page_number < 1 or page_number > len(deck.slides): raise RuntimeError("预览页码超出范围")
-            width,height=1280,720; sx=width/deck.slide_width; sy=height/deck.slide_height
-            canvas=Image.new("RGB",(width,height),"white"); draw=ImageDraw.Draw(canvas)
-            for shape in deck.slides[page_number-1].shapes:
-                x,y,w,h=[int(v) for v in (shape.left*sx,shape.top*sy,shape.width*sx,shape.height*sy)]
-                if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
-                    picture=Image.open(BytesIO(shape.image.blob)).convert("RGB").resize((max(1,w),max(1,h)))
-                    canvas.paste(picture,(x,y)); continue
-                text=""
-                if getattr(shape,"has_text_frame",False): text=shape.text
-                elif getattr(shape,"has_table",False): text="\n".join(" | ".join(c.text for c in row.cells) for row in shape.table.rows)
-                if text:
-                    draw.multiline_text((x,y),text,fill="black",font=_font(max(10,min(24,int(h/max(1,text.count(chr(10))+1)*0.45)))),spacing=4)
-            canvas.save(target,"PNG"); return target
-        except Exception as exc:
-            raise RuntimeError(f"PowerPoint 预览渲染失败：{exc}") from exc
+        raise RuntimeError("无法生成保留原版式的 PPT 预览。请确认已安装 Microsoft PowerPoint，"
+                           "并重试。原始文件和翻译文件均已保留。")
     if ext in {".docx", ".xlsx"}:
         pdf=cache_dir/f"{source.stem}.pdf"
         try:

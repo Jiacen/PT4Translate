@@ -8,50 +8,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-
-def main(source_arg: str, target_arg: str, page_arg: str) -> int:
-    source, target = Path(source_arg), Path(target_arg)
-    app = presentation = None
-    initialized = False
-    try:
-        import pythoncom
-        import win32com.client
-        pythoncom.CoInitialize()
-        initialized = True
-        app = win32com.client.DispatchEx("PowerPoint.Application")
-        app.AutomationSecurity = 3  # Never run macros from a document being previewed.
-        presentation = app.Presentations.Open(str(source.resolve()), ReadOnly=True, WithWindow=False)
-        height = round(1600 * presentation.PageSetup.SlideHeight / presentation.PageSetup.SlideWidth)
-        if page_arg == "all":
-            target.mkdir(parents=True, exist_ok=True)
-            for page in range(1, presentation.Slides.Count + 1):
-                image = target / f"page-{page}-rendered.png"
-                presentation.Slides.Item(page).Export(str(image.resolve()), "PNG", 1600, height)
-            return 0
-        page = int(page_arg)
-        if page < 1 or page > presentation.Slides.Count:
-            return 2
-        target.parent.mkdir(parents=True, exist_ok=True)
-        presentation.Slides.Item(page).Export(str(target.resolve()), "PNG", 1600, height)
-        return 0 if target.exists() and target.stat().st_size else 1
-    except Exception:
-        return 1
-    finally:
-        if presentation is not None:
-            try:
-                presentation.Close()
-            except Exception:
-                pass
-        if app is not None:
-            try:
-                app.Quit()
-            except Exception:
-                pass
-        if initialized:
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sitrain_app.ppt_render import main
 
 
 if __name__ == "__main__":

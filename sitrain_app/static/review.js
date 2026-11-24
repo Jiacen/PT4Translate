@@ -1,9 +1,9 @@
 let reviewData=null, reviewSelection=null, reviewDirty=false, reviewSaving=false, reviewRequest=0, reviewWheelDelta=0, reviewWheelLock=false;
 let wordReviewUnits=[], wordSelectedUnitId=null;
-const reviewZoomByPage=new Map();
+const reviewZoomByFile=new Map();
 
-function reviewZoomKey(){return `${activeFile||''}:${activePage||1}`}
-function currentReviewZoom(){return reviewZoomByPage.get(reviewZoomKey())||1}
+function reviewZoomKey(){return activeFile||''}
+function currentReviewZoom(){return reviewZoomByFile.get(reviewZoomKey())||1}
 function applyReviewZoom(container){
   const canvas=container?.querySelector('.ppt-canvas');if(!canvas)return;
   const zoom=currentReviewZoom();
@@ -11,7 +11,7 @@ function applyReviewZoom(container){
   canvas.style.margin=zoom>1?'0':'0 auto';
   const label=$('#review-zoom');if(label)label.textContent=`缩放 ${Math.round(zoom*100)}%`;
 }
-function resetReviewZoom(){reviewZoomByPage.delete(reviewZoomKey());applyReviewZoom($('#preview'));applyReviewZoom($('#word-preview-stage'))}
+function resetReviewZoom(){reviewZoomByFile.delete(reviewZoomKey());applyReviewZoom($('#preview'));applyReviewZoom($('#word-preview-stage'))}
 
 async function continueReview(){
   if(!leaveReviewEdit())return;
@@ -182,7 +182,7 @@ function installPreviewWheelNavigation(preview){
       event.preventDefault();
       const direction=event.deltaY<0?1:-1;
       const next=Math.min(2.5,Math.max(.5,Math.round((currentReviewZoom()+direction*.1)*10)/10));
-      reviewZoomByPage.set(reviewZoomKey(),next);applyReviewZoom(preview);return;
+      reviewZoomByFile.set(reviewZoomKey(),next);applyReviewZoom(preview);return;
     }
     if(reviewSaving || event.target.closest('.ppt-editor, textarea, input, select, button'))return;
     event.preventDefault();

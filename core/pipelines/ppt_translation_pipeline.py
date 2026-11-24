@@ -733,6 +733,13 @@ def _process_text_runs(text_runs, namespaces: Dict) -> Dict:
         run_texts.append(run_text)
         run_lengths.append(len(run_text))
         run_styles.append(_extract_run_style(text_run, namespaces))
+
+    # a:br is a sibling of a:r, not part of its text. Omitting it merged
+    # headings with subtitles and large text with the smaller explanatory lines.
+    if text_runs and all(run.getparent() is text_runs[0].getparent() for run in text_runs):
+        values = dict(zip(text_runs, run_texts))
+        merged_text = ''.join('\n' if node.tag == f"{{{namespaces['a']}}}br" else values.get(node, '')
+                              for node in text_runs[0].getparent())
     
     return {
         'merged_text': merged_text,
@@ -791,13 +798,14 @@ def _extract_run_style(text_run, namespaces: Dict) -> Dict:
     
     return style_info
 
-def write_translated_content_to_ppt(file_path: str, original_json_path: str, translated_json_path: str, temp_dir, result_dir, src_lang=None, dst_lang=None) -> str:
+def write_translated_content_to_ppt(file_path: str, original_json_path: str, translated_json_path: str, temp_dir, result_dir, src_lang=None, dst_lang=None, preserve_formatting=False) -> str:
     """
     Write translated content back to the PowerPoint file while preserving format and structure.
 
     Args:
         src_lang: Source language code (e.g., 'zh')
         dst_lang: Target language code (e.g., 'ja')
+        preserve_formatting: Keep authored fonts, sizes, autofit and line breaks.
     """
     try:
         # Load original and translated JSON
@@ -805,6 +813,8 @@ def write_translated_content_to_ppt(file_path: str, original_json_path: str, tra
             original_data = json.load(original_file)
         with open(translated_json_path, "r", encoding="utf-8") as translated_file:
             translated_data = json.load(translated_file)
+        if preserve_formatting:
+            original_data = [dict(item, preserve_formatting=True) for item in original_data]
     except Exception as e:
         app_logger.error(f"Failed to load JSON files: {e}")
         raise
@@ -1248,6 +1258,24 @@ def _distribute_text_to_runs(parent_element, translated_text: str, item: Dict, n
     text_runs = parent_element.xpath('.//a:r', namespaces=namespaces)
 
     if not text_runs:
+        return
+
+    if item.get('preserve_formatting'):
+        # Strict SITRAIN policy: change only text, never font/paragraph/body
+        # properties. Keep authored soft breaks as DrawingML a:br nodes instead
+        # of inserting control characters into a:t (which Office can show as □).
+        groups = [[]]
+        for child in parent_element:
+            if child.tag == f"{{{namespaces['a']}}}br":
+                groups.append([])
+            elif child.tag == f"{{{namespaces['a']}}}r":
+                groups[-1].append(child)
+        lines = translated_text.replace('\r\n', '\n').replace('\r', '\n').replace('\v', '\n').split('\n')
+        if len(lines) == len(groups) and all(group or not line for group, line in zip(groups, lines)):
+            for group, line in zip(groups, lines):
+                _simple_text_distribution(group, line, namespaces)
+        else:
+            _simple_text_distribution(text_runs, ' '.join(lines), namespaces)
         return
 
     original_run_texts = item.get('run_texts', [])
