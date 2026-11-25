@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import __version__, db
+from . import __build__, __release__, __version__, db
 from .config import ROOT, ensure_data_dirs
 from .documents import render_preview, word_page_objects
 from .ppt_review import page_objects
@@ -25,11 +25,12 @@ from .review_versions import (apply_same_source, current_version, preview_source
                               review_context, save_edit, save_review_memory, serialized)
 from .glossary_excel import export_global_terms, parse_global_terms
 from .pipeline import (add_version, auto_repair_missing_terms, confirm_manual_term_exceptions, prepare_file, publish, refresh_machine_version,
-                       revalidate_terminology_qa, run_translation, schedule_project_translation,
+                       release_qa_units, revalidate_terminology_qa, run_translation, schedule_project_translation,
                        schedule_translation, start_automatic_translation, start_project_translation)
 from .providers import ProviderError, TranslationRequest, translate
 from .storage import checksum, file_dir, safe_filename, save_upload, upload_checksum
-from .sync import _latest, apply_sync, create_mappings
+from .sync import (_latest, apply_sync, create_mappings, pending_review,
+                   save_mapping_decision, sync_needs_apply, word_page_index)
 from .terminology import normalize
 from .teacher_config import configure_teacher_provider
 
@@ -167,7 +168,7 @@ def _chapter_sync_gate(chapter_id: str, files: list[dict]) -> dict | None:
         return None
     sync = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1",
                   (word["id"],))
-    if not sync:
+    if not sync or sync_needs_apply(chapter_id, sync):
         return {"code": "mapping", "label": "请确认图文对应", "action": "请确认 Word 图片与 PPT 页的对应关系。"}
     if not (sync.get("metadata") or {}).get("sync_review_confirmed"):
         return {"code": "sync_review", "label": "请校验同步结果", "action": "请检查 PPT 图片更新后的 Word 页面。"}
@@ -218,7 +219,7 @@ def health():
         status = {"success":"online", "failed":"error"}.get(state, "warning")
         text = {"online":"已验证", "error":"连接失败", "warning":"待测试"}[status]
         llm = {"status":status, "label":active["name"]}
-    return {"ok":True,"version":__version__,"llm":llm}
+    return {"ok":True,"version":__version__,"build":__build__,"release":__release__,"llm":llm}
 
 
 @app.get("/api/dashboard")
@@ -580,7 +581,9 @@ def file_qa_blockers(file_id: str):
     if not db.row("SELECT id FROM files WHERE id=?", (file_id,)):
         raise HTTPException(404, "文件不存在")
     blockers = []
-    for unit in db.rows("SELECT * FROM translation_units WHERE file_id=? AND status<>'confirmed' ORDER BY page,stable_key", (file_id,)):
+    for unit in release_qa_units(file_id):
+        if unit["status"] == "confirmed":
+            continue
         for issue in unit.get("qa") or []:
             if issue.get("severity") == "blocker":
                 blockers.append({"unit_id": unit["id"], "page": unit.get("page"), "object_ref": unit.get("object_ref"),
@@ -772,6 +775,9 @@ def sync_review_confirm(file_id: str):
     version = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (file_id,))
     if not version:
         raise HTTPException(409, "当前 Word 没有待确认的同步后校验版")
+    file = db.row("SELECT * FROM files WHERE id=?", (file_id,))
+    if file and file.get("chapter_id") and sync_needs_apply(file["chapter_id"], version):
+        raise HTTPException(409, "图片对应关系尚未全部确认，或已发生变化；请完成确认并重新生成同步 Word")
     metadata = version.get("metadata") or {}
     metadata["sync_review_confirmed"] = True
     metadata["sync_review_confirmed_at"] = db.utcnow()
@@ -802,17 +808,28 @@ def _chapter_delivery_versions(chapter_id: str) -> list[dict]:
 
 @app.patch("/api/mappings/{mapping_id}")
 def sync_mapping_confirm(mapping_id: str, body: MappingPatch):
-    mapping=db.row("SELECT * FROM ppt_word_mappings WHERE id=?",(mapping_id,))
-    if not mapping: raise HTTPException(404,"页面映射不存在")
-    db.execute("UPDATE ppt_word_mappings SET slide_number=?,confirmed=?,confidence=CASE WHEN ? THEN MAX(confidence,0.99) ELSE confidence END,updated_at=? WHERE id=?",
-               (body.slide_number,int(body.confirmed),int(body.confirmed),db.utcnow(),mapping_id))
-    return db.row("SELECT * FROM ppt_word_mappings WHERE id=?",(mapping_id,))
+    if not body.confirmed:
+        raise HTTPException(409, "请通过待确认图片页面明确确认对应关系")
+    return sync_mapping_decision(mapping_id, MappingDecision(slide_number=body.slide_number))
 
 
 @app.get("/api/chapters/{chapter_id}/sync/pending")
-def sync_pending(chapter_id: str):
-    rows = db.rows("SELECT * FROM ppt_word_mappings WHERE chapter_id=? AND confirmed=0 AND decision<>'keep_original' ORDER BY media_part", (chapter_id,))
-    return {"mappings": rows}
+def sync_pending(chapter_id: str, limit: int | None = None):
+    try:
+        return pending_review(chapter_id, max(1, min(limit, 1000)) if limit is not None else None)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/chapters/{chapter_id}/sync/word-pages")
+def sync_word_pages(chapter_id: str):
+    mapping = db.row("SELECT word_file_id FROM ppt_word_mappings WHERE chapter_id=? LIMIT 1", (chapter_id,))
+    if not mapping:
+        raise HTTPException(409, "请先建立图片对应关系")
+    try:
+        return word_page_index(mapping["word_file_id"], generate=True)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/mappings/{mapping_id}/word-image")
@@ -823,7 +840,16 @@ def sync_word_image(mapping_id: str):
     source = Path(_latest(mapping["word_file_id"], "working", "original")["path"])
     try:
         with zipfile.ZipFile(source) as archive:
-            image = Image.open(io.BytesIO(archive.read(mapping["media_part"]))).convert("RGB")
+            image = Image.open(io.BytesIO(archive.read(mapping["media_part"])))
+            if image.format in {"WMF", "EMF"}:
+                image.load(dpi=240)
+            image.thumbnail((3200, 2400), Image.Resampling.LANCZOS)
+            if image.mode == "RGBA":
+                background = Image.new("RGB", image.size, "white")
+                background.paste(image, mask=image.getchannel("A"))
+                image = background
+            else:
+                image = image.convert("RGB")
         output = io.BytesIO(); image.save(output, "PNG")
     except Exception as exc:
         raise HTTPException(422, f"无法渲染 Word 图片：{exc}") from exc
@@ -835,14 +861,10 @@ def sync_mapping_decision(mapping_id: str, body: MappingDecision):
     mapping = db.row("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,))
     if not mapping:
         raise HTTPException(404, "图片映射不存在")
-    if body.keep_original:
-        db.execute("UPDATE ppt_word_mappings SET confirmed=0,decision='keep_original',updated_at=? WHERE id=?", (db.utcnow(), mapping_id))
-    elif body.slide_number:
-        db.execute("UPDATE ppt_word_mappings SET slide_number=?,confirmed=1,confidence=0.99,decision='manual',updated_at=? WHERE id=?",
-                   (body.slide_number, db.utcnow(), mapping_id))
-    else:
-        raise HTTPException(422, "请选择 PPT 页，或选择保留 Word 原图")
-    return db.row("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,))
+    try:
+        return save_mapping_decision(mapping_id, body.slide_number, body.keep_original)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @app.get("/api/chapters/{chapter_id}/package")

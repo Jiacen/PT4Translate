@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import posixpath
 import zipfile
 from pathlib import Path
 
@@ -13,6 +14,63 @@ NS = {
     "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
 }
 TEXT_PART = re.compile(r"ppt/(slides|notesSlides|slideMasters|slideLayouts|notesMasters|handoutMasters|diagrams|charts|comments)/[^/]+\.xml$")
+
+
+def inherited_part_pages(source: Path) -> dict[str, list[int]]:
+    try:
+        return _read_inherited_part_pages(source)
+    except (KeyError, IndexError, zipfile.BadZipFile, etree.XMLSyntaxError) as exc:
+        raise ValueError("PPT inheritance graph could not be verified") from exc
+
+
+def _read_inherited_part_pages(source: Path) -> dict[str, list[int]]:
+    """Resolve actual presentation slides to their layouts and masters.
+
+    An unreferenced layout is part of the template, but contributes no text to
+    the current deck. Missing/invalid relationships fail conservatively: callers
+    must not classify unknown template text as unused.
+    """
+    parser = etree.XMLParser(resolve_entities=False, load_dtd=False, no_network=True)
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    with zipfile.ZipFile(source) as package:
+        names = set(package.namelist())
+        pages = {name: [] for name in names if re.fullmatch(r"ppt/(?:slideLayouts|slideMasters)/[^/]+\.xml", name)}
+
+        def relationships(part):
+            path = posixpath.join(posixpath.dirname(part), "_rels", posixpath.basename(part) + ".rels")
+            root = etree.fromstring(package.read(path), parser)
+            return list(root)
+
+        def target(part, relation):
+            if relation.get("TargetMode", "").lower() == "external":
+                raise ValueError("PPT inheritance relationship is external")
+            value = relation.get("Target", "")
+            resolved = posixpath.normpath(value.lstrip("/") if value.startswith("/") else posixpath.join(posixpath.dirname(part), value))
+            if not value or resolved not in names:
+                raise ValueError("PPT inheritance relationship is missing")
+            return resolved
+
+        presentation = "ppt/presentation.xml"
+        root = etree.fromstring(package.read(presentation), parser)
+        by_id = {relation.get("Id"): relation for relation in relationships(presentation)}
+        for page, node in enumerate(root.findall("p:sldIdLst/p:sldId", NS), 1):
+            slide = target(presentation, by_id[node.get(f"{{{rel_ns}}}id")])
+            layouts = [relation for relation in relationships(slide) if relation.get("Type", "").endswith("/slideLayout")]
+            if len(layouts) != 1:
+                raise ValueError("PPT slide layout is ambiguous")
+            layout = target(slide, layouts[0])
+            if layout not in pages:
+                raise ValueError("PPT slide layout part is invalid")
+            pages[layout].append(page)
+            masters = [relation for relation in relationships(layout) if relation.get("Type", "").endswith("/slideMaster")]
+            if len(masters) != 1:
+                raise ValueError("PPT slide master is ambiguous")
+            master = target(layout, masters[0])
+            if master not in pages:
+                raise ValueError("PPT slide master part is invalid")
+            if page not in pages[master]:
+                pages[master].append(page)
+        return pages
 
 
 def paragraph_line_groups(payload: dict) -> list[int]:

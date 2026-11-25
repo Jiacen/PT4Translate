@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
+import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 
@@ -14,6 +19,171 @@ from . import db
 from .documents import document_page_count, render_preview
 from .pipeline import add_version
 from .storage import file_dir
+
+_mapping_lock = threading.RLock()
+_page_index_lock = threading.RLock()
+
+
+def _pair(chapter_id: str) -> tuple[dict, dict]:
+    files = db.rows("SELECT * FROM files WHERE chapter_id=? ORDER BY created_at,id", (chapter_id,))
+    ppt = next((f for f in files if f["extension"] in {".pptx", ".ppt"}), None)
+    word = next((f for f in files if f["extension"] in {".docx", ".doc"}), None)
+    if not ppt or not word:
+        raise RuntimeError("该章节必须同时包含 PPT 和 Word 才能建立同步映射")
+    return ppt, word
+
+
+def word_base_version(file_id: str) -> dict:
+    versions = db.rows("SELECT * FROM file_versions WHERE file_id=? AND version_type='published' ORDER BY sequence DESC", (file_id,))
+    version = next((v for v in versions if not (v.get("metadata") or {}).get("ppt_sync")), None)
+    if not version:
+        raise RuntimeError("未找到 Word 的独立已发布版本")
+    return version
+
+
+def _source_signature(ppt: dict, word: dict) -> str:
+    versions = [_latest(f["id"], "working", "original") for f in (ppt, word)]
+    return json.dumps([(f["id"], v["checksum"]) for f, v in zip((ppt, word), versions)], separators=(",", ":"))
+
+
+def _ensure_batch(chapter_id: str, mappings: list[dict]) -> dict | None:
+    if not mappings:
+        return None
+    ppt, word = _pair(chapter_id)
+    if any(m["ppt_file_id"] != ppt["id"] or m["word_file_id"] != word["id"] for m in mappings):
+        raise RuntimeError("本章文件配对已变化，请先核对；原有人工确认已保留")
+    signature = _source_signature(ppt, word)
+    initial = sum(m["decision"] != "automatic" for m in mappings)
+    with db.connect() as conn:
+        conn.execute("INSERT OR IGNORE INTO mapping_batches VALUES(?,?,?,?,?,?)",
+                     (chapter_id, ppt["id"], word["id"], signature, initial, db.utcnow()))
+    batch = db.row("SELECT * FROM mapping_batches WHERE chapter_id=?", (chapter_id,))
+    if batch["source_signature"] != signature or any(m["ppt_file_id"] != ppt["id"] or m["word_file_id"] != word["id"] for m in mappings):
+        raise RuntimeError("本章源文件已变化，请先核对文件配对；原有人工确认已保留")
+    return batch
+
+
+def mapping_signature(mappings: list[dict]) -> str:
+    payload = sorted((m["id"], m["slide_number"], m["confirmed"], m["decision"]) for m in mappings)
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+
+def sync_needs_apply(chapter_id: str, version: dict | None = None) -> bool:
+    mappings = db.rows("SELECT * FROM ppt_word_mappings WHERE chapter_id=?", (chapter_id,))
+    if not mappings:
+        return version is None
+    if any(not m["confirmed"] and m["decision"] != "keep_original" for m in mappings):
+        return True
+    if version is None:
+        version = db.row("SELECT * FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (mappings[0]["word_file_id"],))
+    if not version:
+        return True
+    metadata = version.get("metadata") or {}
+    if metadata.get("mapping_choices_changed"):
+        return True
+    if metadata.get("mapping_signature") and metadata["mapping_signature"] != mapping_signature(mappings):
+        return True
+    try:
+        return (metadata.get("ppt_version") != _latest(mappings[0]["ppt_file_id"], "published")["id"] or
+                metadata.get("word_base_version") != word_base_version(mappings[0]["word_file_id"])["id"])
+    except RuntimeError:
+        return True
+
+
+def _page_index_path(word_id: str) -> tuple[dict, Path]:
+    version = word_base_version(word_id)
+    return version, file_dir(word_id) / "mapping_pages" / f"word-pages-v1-{version['checksum']}.json"
+
+
+def word_page_index(word_id: str, *, generate: bool = False) -> dict:
+    if not generate:
+        return _word_page_index(word_id)
+    with _page_index_lock:
+        return _word_page_index(word_id, generate=generate)
+
+
+def _word_page_index(word_id: str, *, generate: bool = False) -> dict:
+    version, target = _page_index_path(word_id)
+    if target.exists():
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+            if data.get("status") in {"ready", "partial"} or not generate:
+                return data
+        except (ValueError, OSError):
+            pass
+    if not generate:
+        return {"status": "not_loaded", "pages": {}, "locations": {}}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, "--index-word-images", version["path"], str(target)]
+    else:
+        helper = Path(__file__).resolve().parents[1] / "scripts" / "index_word_images.py"
+        command = [sys.executable, str(helper), version["path"], str(target)]
+    try:
+        run = subprocess.run(command, capture_output=True, timeout=180, check=False,
+                             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        if run.returncode == 0 and target.exists():
+            return json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    data = {"status": "unavailable", "pages": {}, "locations": {},
+            "message": "未能读取 Word 实际页码，请确认本机已安装 Word 后重试。"}
+    target.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return data
+
+
+def pending_review(chapter_id: str, limit: int | None = None) -> dict:
+    mappings = db.rows("SELECT * FROM ppt_word_mappings WHERE chapter_id=?", (chapter_id,))
+    batch = _ensure_batch(chapter_id, mappings)
+    pending = [m for m in mappings if not m["confirmed"] and m["decision"] != "keep_original"]
+    completed = sum(m["decision"] in {"manual", "keep_original"} for m in mappings)
+    result = {"initialized": bool(batch), "mappings": [], "progress": {
+        "initial_pending": batch["initial_pending"] if batch else 0,
+        "completed": completed, "remaining": len(pending),
+        "automatic": sum(m["decision"] == "automatic" for m in mappings)}}
+    if not batch:
+        return result
+    ppt, word = _pair(chapter_id)
+    index = word_page_index(word["id"])
+    for mapping in pending:
+        mapping["word_pages"] = index.get("pages", {}).get(mapping["media_part"], [])
+        mapping["word_locations"] = index.get("locations", {}).get(mapping["media_part"], [])
+    pending.sort(key=lambda m: (min(m["word_pages"], default=10**9),
+                               min((loc["position"] for loc in m["word_locations"]), default=10**9),
+                               int(re.search(r"image(\d+)", m["media_part"], re.I).group(1)) if re.search(r"image(\d+)", m["media_part"], re.I) else 0))
+    result.update(mappings=pending[:limit] if limit else pending, word_file_id=word["id"],
+                  word_name=word["original_name"], ppt_name=ppt["original_name"],
+                  ppt_file_id=ppt["id"], ppt_version_id=_latest(ppt["id"], "published")["id"],
+                  ppt_pages=_slide_count(Path(_latest(ppt["id"], "published")["path"])),
+                  page_index_status=index["status"], page_index_message=index.get("message"),
+                  needs_apply=sync_needs_apply(chapter_id))
+    return result
+
+
+def save_mapping_decision(mapping_id: str, slide_number: int | None, keep_original: bool) -> dict:
+    if bool(slide_number) == bool(keep_original):
+        raise RuntimeError("请选择一个 PPT 页，或选择保留 Word 原图")
+    mapping = db.row("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,))
+    if not mapping:
+        raise RuntimeError("图片映射不存在")
+    if slide_number is not None and not 1 <= slide_number <= _slide_count(Path(_latest(mapping["ppt_file_id"], "published")["path"])):
+        raise RuntimeError("PPT 页码超出文件的实际范围")
+    decision = "keep_original" if keep_original else "manual"
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = dict(conn.execute("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,)).fetchone())
+        if existing["confirmed"] or existing["decision"] == "keep_original":
+            if existing["decision"] == decision and (keep_original or existing["slide_number"] == slide_number):
+                return db.row("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,))
+            raise RuntimeError("这张图片已确认，请关闭后重新打开，查看最新进度")
+        conn.execute("UPDATE ppt_word_mappings SET slide_number=?,confirmed=?,decision=?,updated_at=? WHERE id=?",
+                     (slide_number or existing["slide_number"], int(not keep_original), decision, db.utcnow(), mapping_id))
+        version = conn.execute("SELECT id,metadata_json FROM file_versions WHERE file_id=? AND version_type='sync_review' ORDER BY sequence DESC LIMIT 1", (mapping["word_file_id"],)).fetchone()
+        if version:
+            metadata = json.loads(version["metadata_json"] or "{}")
+            metadata.update(mapping_choices_changed=True, sync_review_confirmed=False)
+            conn.execute("UPDATE file_versions SET metadata_json=? WHERE id=?", (json.dumps(metadata, ensure_ascii=False), version["id"]))
+    return db.row("SELECT * FROM ppt_word_mappings WHERE id=?", (mapping_id,))
 
 
 def _latest(file_id: str, *types: str) -> dict:
@@ -147,6 +317,11 @@ def _visual_mappings(word_path: Path, ppt_path: Path, cache_dir: Path) -> list[t
 
 
 def create_mappings(chapter_id: str) -> list[dict]:
+    with _mapping_lock:
+        return _create_mappings(chapter_id)
+
+
+def _create_mappings(chapter_id: str) -> list[dict]:
     files = db.rows("SELECT * FROM files WHERE chapter_id=?",(chapter_id,))
     ppt = next((f for f in files if f["extension"] in {".pptx",".ppt"}),None)
     word = next((f for f in files if f["extension"] in {".docx",".doc"}),None)
@@ -154,6 +329,10 @@ def create_mappings(chapter_id: str) -> list[dict]:
         raise RuntimeError("该章节必须同时包含 PPT 和 Word 才能建立同步映射")
     if ppt["status"] != "published" or word["status"] != "published":
         raise RuntimeError("请先分别确认发布本章节的 PPT 和 Word；同步会以两份已确认版本作为输入")
+    existing = db.rows("SELECT * FROM ppt_word_mappings WHERE chapter_id=?", (chapter_id,))
+    if existing:
+        _ensure_batch(chapter_id, existing)
+        return existing
     ppt_path = Path(_latest(ppt["id"],"published")["path"])
     original_ppt_path = Path(_latest(ppt["id"],"working","original")["path"])
     word_path = Path(_latest(word["id"],"working","original")["path"])
@@ -162,13 +341,13 @@ def create_mappings(chapter_id: str) -> list[dict]:
         raise RuntimeError("Word 中未发现可映射的幻灯片图片")
     now = db.utcnow()
     with db.connect() as conn:
-        # A new visual pass supersedes any older sequence-based guesses,
-        # including media that is not a full-slide candidate.
-        conn.execute("DELETE FROM ppt_word_mappings WHERE chapter_id=? AND word_file_id=?", (chapter_id, word["id"]))
         for part, slide_no, confidence, confirmed, choices in visual:
             decision = "automatic" if confirmed else "pending"
             conn.execute("INSERT INTO ppt_word_mappings(id,chapter_id,ppt_file_id,word_file_id,slide_number,media_part,confidence,confirmed,candidates_json,decision,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                          (db.new_id(),chapter_id,ppt["id"],word["id"],slide_no,part,confidence,int(confirmed),json.dumps(choices,ensure_ascii=False),decision,now))
+        conn.execute("INSERT INTO mapping_batches VALUES(?,?,?,?,?,?)",
+                     (chapter_id, ppt["id"], word["id"], _source_signature(ppt, word),
+                      sum(not confirmed for _, _, _, confirmed, _ in visual), now))
     return db.rows("SELECT * FROM ppt_word_mappings WHERE chapter_id=? ORDER BY slide_number",(chapter_id,))
 
 
@@ -199,32 +378,66 @@ def _changed_word_pages(before: Path, after: Path, file_id: str, review_version_
 
 
 def apply_sync(chapter_id: str) -> str:
+    with _mapping_lock:
+        return _apply_sync(chapter_id)
+
+
+def _apply_sync(chapter_id: str) -> str:
     mappings = db.rows("SELECT * FROM ppt_word_mappings WHERE chapter_id=? ORDER BY slide_number",(chapter_id,))
     if not mappings:
         mappings = create_mappings(chapter_id)
+    _ensure_batch(chapter_id, mappings)
+    if any(not m["confirmed"] and m["decision"] != "keep_original" for m in mappings):
+        raise RuntimeError("请先逐项确认所有待确认图片，再生成同步 Word")
+    if not sync_needs_apply(chapter_id):
+        return _latest(mappings[0]["word_file_id"], "sync_review")["id"]
     resolved = [mapping for mapping in mappings if mapping["confirmed"]]
-    if not resolved:
-        raise RuntimeError("没有可可靠识别的 Word 幻灯片图片，未生成同步版本")
-    ppt = db.row("SELECT * FROM files WHERE id=?", (resolved[0]["ppt_file_id"],))
-    word = db.row("SELECT * FROM files WHERE id=?", (resolved[0]["word_file_id"],))
+    ppt = db.row("SELECT * FROM files WHERE id=?", (mappings[0]["ppt_file_id"],))
+    word = db.row("SELECT * FROM files WHERE id=?", (mappings[0]["word_file_id"],))
     if not ppt or not word or ppt["status"] != "published" or word["status"] != "published":
         raise RuntimeError("PPT 和 Word 都必须先确认发布，才能生成同步 Word 交付版")
     # Synchronization must use the completed translation/review versions.  The
     # original pair is immutable input and would otherwise put English slides
     # back into an already translated Word chapter.
-    ppt_path = Path(_latest(resolved[0]["ppt_file_id"],"published")["path"])
+    ppt_path = Path(_latest(ppt["id"],"published")["path"])
     published_word_versions = db.rows("SELECT * FROM file_versions WHERE file_id=? AND version_type='published' ORDER BY sequence DESC",
-                                      (resolved[0]["word_file_id"],))
+                                      (word["id"],))
     word_version = next((version for version in published_word_versions if not (version.get("metadata") or {}).get("ppt_sync")), None)
     if not word_version:
         raise RuntimeError("未找到 Word 的独立已发布版本，不能用已同步文件再次覆盖")
     word_path = Path(word_version["path"])
-    export_dir = file_dir(resolved[0]["word_file_id"])/"slide_exports"
+    export_dir = file_dir(word["id"])/"slide_exports"
     export_dir.mkdir(parents=True,exist_ok=True)
+    replacements = _export_replacements(ppt_path, resolved, export_dir) if resolved else {}
+    output = file_dir(word["id"])/"published"/f"{word_path.stem}_synced.docx"
+    output.parent.mkdir(parents=True,exist_ok=True)
+    if output.exists():
+        output = output.with_name(f"{output.stem}_{db.new_id()[:8]}.docx")
+    with zipfile.ZipFile(word_path) as src, zipfile.ZipFile(output,"x",zipfile.ZIP_DEFLATED) as dst:
+        for info in src.infolist():
+            dst.writestr(info,replacements.get(info.filename,src.read(info.filename)))
+    version_id = add_version(word["id"], "sync_review", output, {"ppt_sync": True,
+                             "sync_review": True, "mapping_count": len(resolved),
+                             "unmapped_count": len(mappings) - len(resolved), "pending_count": 0,
+                             "mapping_signature": mapping_signature(mappings),
+                             "ppt_version": _latest(ppt["id"], "published")["id"],
+                             "word_base_version": word_version["id"]})
+    changed_pages = _changed_word_pages(word_path, output, word["id"], version_id) if resolved else []
+    version = db.row("SELECT metadata_json FROM file_versions WHERE id=?", (version_id,))
+    metadata = version.get("metadata") or {}
+    metadata["changed_pages"] = changed_pages
+    db.execute("UPDATE file_versions SET metadata_json=? WHERE id=?", (json.dumps(metadata, ensure_ascii=False), version_id))
+    return version_id
+
+
+def _export_replacements(ppt_path: Path, resolved: list[dict], export_dir: Path) -> dict:
+    app = deck = None
+    initialized = False
     try:
         import pythoncom
         import win32com.client
         pythoncom.CoInitialize()
+        initialized = True
         app = win32com.client.DispatchEx("PowerPoint.Application")
         deck = app.Presentations.Open(str(ppt_path.resolve()),WithWindow=False)
         replacements = {}
@@ -234,31 +447,15 @@ def apply_sync(chapter_id: str) -> str:
             target = export_dir/f"slide_{mapping['slide_number']}.{ext.lower()}"
             deck.Slides(mapping["slide_number"]).Export(str(target.resolve()),export_format)
             replacements[mapping["media_part"]] = target.read_bytes()
-        deck.Close(); app.Quit(); pythoncom.CoUninitialize()
+        return replacements
     except Exception as exc:
-        try:
-            deck.Close(); app.Quit()
-        except Exception:
-            pass
-        try: pythoncom.CoUninitialize()
-        except Exception: pass
         raise RuntimeError(f"PowerPoint 页面渲染失败：{exc}") from exc
-    output = file_dir(resolved[0]["word_file_id"])/"published"/f"{word_path.stem}_synced.docx"
-    output.parent.mkdir(parents=True,exist_ok=True)
-    if output.exists():
-        output = output.with_name(f"{output.stem}_{db.new_id()[:8]}.docx")
-    with zipfile.ZipFile(word_path) as src, zipfile.ZipFile(output,"x",zipfile.ZIP_DEFLATED) as dst:
-        for info in src.infolist():
-            dst.writestr(info,replacements.get(info.filename,src.read(info.filename)))
-    pending_count = sum(1 for mapping in mappings if not mapping["confirmed"] and mapping.get("decision") != "keep_original")
-    version_id = add_version(resolved[0]["word_file_id"], "sync_review", output, {"ppt_sync": True,
-                             "sync_review": True, "mapping_count": len(resolved),
-                             "unmapped_count": len(mappings) - len(resolved), "pending_count": pending_count,
-                             "ppt_version": _latest(resolved[0]["ppt_file_id"], "published")["id"],
-                             "word_base_version": word_version["id"]})
-    changed_pages = _changed_word_pages(word_path, output, resolved[0]["word_file_id"], version_id)
-    version = db.row("SELECT metadata_json FROM file_versions WHERE id=?", (version_id,))
-    metadata = version.get("metadata") or {}
-    metadata["changed_pages"] = changed_pages
-    db.execute("UPDATE file_versions SET metadata_json=? WHERE id=?", (json.dumps(metadata, ensure_ascii=False), version_id))
-    return version_id
+    finally:
+        if deck is not None:
+            try: deck.Close()
+            except Exception: pass
+        if app is not None:
+            try: app.Quit()
+            except Exception: pass
+        if initialized:
+            pythoncom.CoUninitialize()

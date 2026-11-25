@@ -85,6 +85,8 @@ def _fresh_database(provider: dict, path: Path) -> bytes:
 
 def issue(runtime: Path, destination: Path, teachers: list[str], relay_url: str | None = None,
           source_db: Path | None = None) -> None:
+    from sitrain_app import __build__, __release__, __version__
+
     if bool(relay_url) == bool(source_db):
         raise ValueError("请选择统一入口模式或共享本机 Key 试用模式")
     url = None
@@ -139,9 +141,16 @@ def issue(runtime: Path, destination: Path, teachers: list[str], relay_url: str 
                     archive.writestr("SITRAIN-Teacher/sitrain_data/sitrain.db", seed_db)
                 archive.writestr("SITRAIN-Teacher/使用手册.html", manual_html)
                 archive.write(manual_pdf, "SITRAIN-Teacher/使用手册.pdf")
+                archive.writestr("SITRAIN-Teacher/version.json", json.dumps({"product": "SITRAIN-Teacher", "version": __version__, "build": __build__, "release": __release__}, ensure_ascii=False, indent=2))
+                release_notes = ROOT / "docs" / "releases" / f"v{__release__}.txt"
+                if not release_notes.is_file():
+                    release_notes = ROOT / "docs" / "releases" / f"v{__version__}.txt"
+                if release_notes.is_file():
+                    archive.write(release_notes, "SITRAIN-Teacher/版本说明.txt")
                 for picture, relative in manual_pictures:
                     archive.write(picture, "SITRAIN-Teacher/" + relative)
                 archive.writestr("SITRAIN-Teacher/使用说明.txt",
+                                 f"SITRAIN 教材翻译平台 v{__release__}\n"
                                  "解压整个 SITRAIN-Teacher 文件夹，双击 SITRAIN-Teacher.exe。\n"
                                  "首次使用请打开同目录的 使用手册.pdf，按图文步骤从启动走到交付。\n"
                                  "浏览器地址：http://127.0.0.1:9000/\n"

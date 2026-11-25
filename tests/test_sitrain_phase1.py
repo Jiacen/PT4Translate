@@ -29,7 +29,8 @@ def client(tmp_path, monkeypatch):
 def test_health_and_dual_entry_data_model(client):
     health = client.get("/api/health").json()
     assert health["ok"] is True
-    assert health["version"] == "0.1.0"
+    assert health["version"] == "0.1.2"
+    assert health["release"] == "0.1.2-fix2"
     assert health["llm"]["status"] == "neutral"
     project = client.post("/api/projects", json={"name":"TIA Portal 教材","description":"回归"}).json()
     chapter = client.post(f"/api/projects/{project['id']}/chapters", json={"name":"用户界面"}).json()
@@ -444,6 +445,30 @@ def test_ppt_alttext_qa_warns_but_does_not_block_release():
     engine = TerminologyEngine([])
     issues = _qa_issues({"unit_type": "ppt_alttext", "source_text": "click left 2"}, engine, "单击左侧")
     assert any(issue["code"] == "NUMBER_CHANGED" and issue["severity"] == "warning" for issue in issues)
+
+
+@pytest.mark.parametrize(('source', 'target'), [
+    ('Not-Aus (1-phasig)', '单相'), ('Not-Aus (2-phasig)', '双相'),
+    ('1-phase supply', '单相供电'), ('2-phase supply', '两相供电'),
+])
+def test_phase_count_can_use_equivalent_chinese_count_words(source, target):
+    assert not [issue for issue in residual_source_issues(source, target) if issue['code'] == 'NUMBER_CHANGED']
+
+
+@pytest.mark.parametrize(('source', 'target'), [
+    ('Not-Aus (1-phasig)', '双相'), ('Not-Aus (2-phasig)', '单相'),
+    ('24 V', '单相'), ('12-phase supply', '双相供电'), ('Input 1', '单击按钮'),
+])
+def test_phase_aliases_do_not_hide_changed_parameters(source, target):
+    assert [issue for issue in residual_source_issues(source, target) if issue['code'] == 'NUMBER_CHANGED']
+
+
+@pytest.mark.parametrize('usage', [True, False, None])
+def test_only_proven_unused_templates_downgrade_release_issues(usage):
+    unit = {'unit_type': 'master_layout', 'source_text': 'Template limit 9', 'source_payload': {'used_in_slides': usage}}
+    issues = pipeline._qa_issues(unit, TerminologyEngine([]), '模板限制')
+    expected = 'warning' if usage is False else 'blocker'
+    assert any(issue['code'] == 'NUMBER_CHANGED' and issue['severity'] == expected for issue in issues)
 
 
 def test_word_page_field_qa_warns_but_does_not_block_release():

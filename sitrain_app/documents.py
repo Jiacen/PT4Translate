@@ -245,8 +245,18 @@ def _office_extract(path: Path, temp_dir: Path) -> tuple[Path, list[dict]]:
     else:
         raise ValueError(ext)
     data = json.loads(json_path.read_text(encoding="utf-8"))
+    part_pages = None
+    if ext == ".pptx":
+        from .ppt_fidelity import inherited_part_pages
+        try:
+            part_pages = inherited_part_pages(path)
+        except (KeyError, ValueError, OSError, zipfile.BadZipFile):
+            pass  # Unknown usage keeps the normal strict QA policy.
     units = []
     for item in data:
+        if item.get("type") == "master_layout" and part_pages is not None and item.get("part_path") in part_pages:
+            item["inherited_pages"] = part_pages[item["part_path"]]
+            item["used_in_slides"] = bool(item["inherited_pages"])
         page = item.get("slide_index") or item.get("page")
         if ext == ".xlsx":
             page = item.get("sheet")

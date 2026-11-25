@@ -5,6 +5,7 @@ import zipfile
 from fastapi.testclient import TestClient
 
 from sitrain_app import db
+from sitrain_app import __version__
 from sitrain_app.relay_server import app as relay_app
 from scripts.issue_teacher_packages import issue
 
@@ -36,6 +37,9 @@ def test_teacher_package_contains_clean_seed_only(tmp_path):
             assert "SITRAIN-Teacher/sitrain_data/sitrain.db" in names
             assert "SITRAIN-Teacher/使用手册.html" in names
             assert "SITRAIN-Teacher/使用手册.pdf" in names
+            assert json.loads(archive.read("SITRAIN-Teacher/version.json"))["version"] == __version__
+            assert "SITRAIN-Teacher/版本说明.txt" in names
+            assert f"v{__version__}" in archive.read("SITRAIN-Teacher/使用说明.txt").decode("utf-8")
             assert archive.read("SITRAIN-Teacher/使用手册.pdf").startswith(b"%PDF-")
             assert "SITRAIN-Teacher/images/01-welcome.png" in names
             assert "教师绿色版 Pilot 使用手册" in archive.read("SITRAIN-Teacher/使用手册.html").decode("utf-8")

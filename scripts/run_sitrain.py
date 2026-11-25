@@ -20,6 +20,12 @@ def main():
         from sitrain_app.ppt_render import main as render_ppt
         return render_ppt(*sys.argv[2:])
 
+    if sys.argv[1:2] == ["--index-word-images"]:
+        if len(sys.argv) != 4:
+            return 2
+        from sitrain_app.word_image_index import main as index_word
+        return index_word(*sys.argv[2:])
+
     os.chdir(ROOT)
     import uvicorn
     from sitrain_app.main import app

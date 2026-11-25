@@ -102,6 +102,71 @@ def test_review_export_preserves_package_and_shared_picture(deck_client):
     assert client.patch(endpoint+'/text', json={'base_version':reviewed['id'], 'object_id':text['id'], 'paragraphs':['Wrong','Wrong']}).status_code == 409
 
 
+def test_publish_rechecks_legacy_unused_templates_without_changing_review_text(deck_client):
+    import json
+
+    client, fid, original = deck_client
+    deck = Presentation(original)
+    unused = str(deck.slide_layouts[0].part.partname).lstrip('/')
+    before_bytes = original.read_bytes()
+    now = db.utcnow()
+
+    def insert(key, source, target, kind='master_layout', page=None, payload=None, issues=None, status='pending_review', human=None):
+        db.execute("""INSERT INTO translation_units(id,file_id,stable_key,page,unit_type,source_text,machine_text,human_text,status,
+                      source_payload_json,qa_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (key, fid, key, page, kind, source, target, human, status, json.dumps(payload or {}), json.dumps(issues or []), now))
+
+    for number in (1, 2):
+        insert(f'unused-{number}', f'Not-Aus ({number}-phasig)', '停止装置', payload={'part_path': unused},
+               issues=[{'code': 'NUMBER_CHANGED', 'severity': 'blocker', 'message': f'数字可能丢失：{number}'}])
+    insert('visible-voltage', 'Voltage 24 V', '电压 V', kind='text_paragraph', page=1)
+    insert('custom-layout', 'Watch spacing', '注意间距', kind='text_paragraph', page=1,
+           issues=[{'code': 'LAYOUT_OVERFLOW', 'severity': 'blocker', 'message': '自定义版式检查'}])
+    insert('confirmed', 'Manual 7', '原机翻', kind='text_paragraph', page=1, status='confirmed', human='教师已确认的译文',
+           issues=[{'code': 'NUMBER_CHANGED', 'severity': 'blocker', 'message': '已人工确认'}])
+    db.execute("UPDATE translation_units SET revision=4 WHERE id='confirmed'")
+    add_version(fid, 'review', original, {'base_version': current_version(fid)['id']})
+    before = db.rows('SELECT id,source_text,machine_text,human_text,status,revision FROM translation_units ORDER BY id')
+
+    blockers = client.get(f'/api/files/{fid}/qa-blockers').json()['blockers']
+    assert {issue['unit_id'] for issue in blockers} == {'visible-voltage', 'custom-layout'}
+    blocked = client.post(f'/api/files/{fid}/publish')
+    assert blocked.status_code == 409 and '2 个' in blocked.json()['detail']
+    assert db.rows('SELECT id,source_text,machine_text,human_text,status,revision FROM translation_units ORDER BY id') == before
+    for number in (1, 2):
+        unit = db.row('SELECT * FROM translation_units WHERE id=?', (f'unused-{number}',))
+        assert unit['source_payload']['used_in_slides'] is False
+        assert unit['source_payload']['inherited_pages'] == []
+        assert any(issue['code'] == 'NUMBER_CHANGED' and issue['severity'] == 'warning' for issue in unit['qa'])
+
+    db.execute("UPDATE translation_units SET human_text='电压 24 V',status='modified',revision=revision+1 WHERE id='visible-voltage'")
+    db.execute("UPDATE translation_units SET qa_json='[]' WHERE id='custom-layout'")
+    published = client.post(f'/api/files/{fid}/publish')
+    assert published.status_code == 200, published.text
+    assert client.get(f'/api/versions/{published.json()["version_id"]}/download').content == before_bytes
+    confirmed = db.row("SELECT * FROM translation_units WHERE id='confirmed'")
+    assert confirmed['human_text'] == '教师已确认的译文' and confirmed['revision'] == 4 and confirmed['status'] == 'confirmed'
+    assert original.read_bytes() == before_bytes
+
+
+def test_used_and_unknown_template_issues_still_block_publish(deck_client):
+    import json
+
+    client, fid, original = deck_client
+    used = str(Presentation(original).slides[0].slide_layout.part.partname).lstrip('/')
+    for key, part in [('used', used), ('unknown', 'ppt/slideLayouts/not-present.xml')]:
+        db.execute("""INSERT INTO translation_units(id,file_id,stable_key,unit_type,source_text,machine_text,status,
+                      source_payload_json,qa_json,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                   (key, fid, key, 'master_layout', 'Template limit 9', '模板限制', 'pending_review',
+                    json.dumps({'part_path': part, 'used_in_slides': False}), '[]', db.utcnow()))
+    response = client.post(f'/api/files/{fid}/publish')
+    assert response.status_code == 409, response.text
+    assert db.row("SELECT * FROM translation_units WHERE id='used'")['source_payload']['used_in_slides'] is True
+    assert db.row("SELECT * FROM translation_units WHERE id='unknown'")['source_payload']['used_in_slides'] is None
+    blockers = client.get(f'/api/files/{fid}/qa-blockers').json()['blockers']
+    assert {issue['unit_id'] for issue in blockers} == {'used', 'unknown'}
+
+
 def test_cells_groups_validation_and_cache(deck_client):
     client, fid, original = deck_client
     endpoint = f'/api/files/{fid}/pages/1'

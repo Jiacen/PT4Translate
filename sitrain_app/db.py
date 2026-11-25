@@ -112,6 +112,12 @@ CREATE TABLE IF NOT EXISTS ppt_word_mappings (
   decision TEXT NOT NULL DEFAULT 'pending', updated_at TEXT NOT NULL,
   UNIQUE(word_file_id, media_part)
 );
+CREATE TABLE IF NOT EXISTS mapping_batches (
+  chapter_id TEXT PRIMARY KEY REFERENCES chapters(id) ON DELETE CASCADE,
+  ppt_file_id TEXT NOT NULL REFERENCES files(id), word_file_id TEXT NOT NULL REFERENCES files(id),
+  source_signature TEXT NOT NULL, initial_pending INTEGER NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_files_chapter ON files(chapter_id);
 CREATE INDEX IF NOT EXISTS idx_units_file_status ON translation_units(file_id,status);
 CREATE INDEX IF NOT EXISTS idx_versions_file ON file_versions(file_id,version_type,sequence);

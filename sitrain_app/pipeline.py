@@ -11,7 +11,7 @@ from . import db
 from .documents import (TRANSLATE_OFFICE_IMAGE_TEXT, convert_legacy, document_page_count,
                         extract_units, preflight, prepare_preview_cache, rebuild)
 from .providers import TranslationRequest, translate
-from .ppt_fidelity import paragraph_line_groups
+from .ppt_fidelity import inherited_part_pages, paragraph_line_groups
 from .storage import checksum, file_dir
 from .review_versions import serialized
 from .terminology import Term, TerminologyEngine, normalize, residual_source_issues
@@ -229,7 +229,58 @@ def _qa_issues(unit: dict, engine: TerminologyEngine, translated: str) -> list[d
                 issue["severity"] = "warning"
                 label = "PPT 辅助描述" if unit.get("unit_type") == "ppt_alttext" else "Word 自动字段"
                 issue["message"] = label + "：" + issue["message"]
+    if unit.get("unit_type") == "master_layout" and payload.get("used_in_slides") is False:
+        for issue in issues:
+            issue["severity"] = "warning"
+            issue["message"] = "PPT 未使用的模板版式（不影响当前页面）：" + issue["message"]
     return issues
+
+
+@serialized
+def release_qa_units(file_id: str, persist: bool = False) -> list[dict]:
+    """Recheck old stored QA without changing translations or confirmations."""
+    file = db.row("SELECT * FROM files WHERE id=?", (file_id,))
+    if not file:
+        raise RuntimeError("文件不存在")
+    units = db.rows("SELECT * FROM translation_units WHERE file_id=? ORDER BY CAST(stable_key AS INTEGER),stable_key", (file_id,))
+    part_pages = None
+    if file["kind"] == "powerpoint" and any(u["unit_type"] == "master_layout" for u in units):
+        original = _version(file_id, "working") or _version(file_id, "original")
+        try:
+            part_pages = inherited_part_pages(Path(original["path"])) if original else None
+        except (KeyError, ValueError, OSError):
+            pass
+    _records, engine = _terms(file.get("project_id"), file["source_language"], file["target_language"])
+    changes = []
+    owned_codes = {"TERM_MISSING", "SOURCE_RESIDUAL", "NUMBER_CHANGED"}
+    for unit in units:
+        if unit["status"] in {"confirmed", "skipped_image"}:
+            continue
+        translated = unit.get("human_text") if unit.get("human_text") is not None else unit.get("machine_text")
+        if translated is None:
+            continue
+        old_payload, old_qa, old_status = unit.get("source_payload") or {}, unit.get("qa") or [], unit["status"]
+        payload = dict(old_payload)
+        if unit["unit_type"] == "master_layout":
+            inherited = part_pages.get(payload.get("part_path")) if part_pages is not None else None
+            payload["inherited_pages"] = inherited
+            payload["used_in_slides"] = bool(inherited) if inherited is not None else None
+        unit["source_payload"] = payload
+        unit["qa"] = [issue for issue in old_qa if issue.get("code") not in owned_codes] + _qa_issues(unit, engine, translated)
+        if _has_required_term_blocker(unit["qa"]):
+            unit["status"] = "terminology_issue"
+        elif old_status == "terminology_issue":
+            unit["status"] = "pending_review"
+        if payload != old_payload or unit["qa"] != old_qa or unit["status"] != old_status:
+            changes.append((json.dumps(payload, ensure_ascii=False), json.dumps(unit["qa"], ensure_ascii=False),
+                            unit["status"], db.utcnow(), unit["id"], unit["revision"]))
+    if persist and changes:
+        with db.connect() as conn:
+            for change in changes:
+                result = conn.execute("UPDATE translation_units SET source_payload_json=?,qa_json=?,status=?,updated_at=? WHERE id=? AND revision=?", change)
+                if result.rowcount != 1:
+                    raise RuntimeError("校对内容刚刚发生变化，请刷新后再次确认发布")
+    return units
 
 
 def _has_required_term_blocker(issues: list[dict]) -> bool:
@@ -420,7 +471,7 @@ def publish(file_id: str) -> str:
     file = db.row("SELECT * FROM files WHERE id=?",(file_id,))
     source_v = _version(file_id,"working") or _version(file_id,"original")
     source = Path(source_v["path"])
-    units = db.rows("SELECT * FROM translation_units WHERE file_id=? ORDER BY CAST(stable_key AS INTEGER),stable_key",(file_id,))
+    units = release_qa_units(file_id, persist=True)
     blockers = [q for u in units for q in (u.get("qa") or []) if q.get("severity")=="blocker" and u["status"]!="confirmed"]
     if blockers:
         raise RuntimeError(f"仍有 {len(blockers)} 个阻止发布的 QA 问题")

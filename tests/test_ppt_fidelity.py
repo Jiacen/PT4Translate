@@ -14,7 +14,7 @@ from pptx.oxml.xmlchemy import OxmlElement
 from pptx.util import Inches, Pt
 
 from sitrain_app import documents, ppt_render, providers
-from sitrain_app.ppt_fidelity import NS, paragraph_line_groups, verify_pptx_preservation
+from sitrain_app.ppt_fidelity import NS, inherited_part_pages, paragraph_line_groups, verify_pptx_preservation
 
 
 @pytest.fixture
@@ -82,6 +82,24 @@ def test_translation_keeps_background_video_callouts_bullets_and_fonts(rich_deck
     assert deck.slides[0].shapes[1].text == '步骤 1\v控制面板'
     assert [shape.text for shape in deck.slides[0].shapes[3].shapes] == [str(n) for n in range(1, 9)]
     assert deck.slides[0].shapes[4].table.cell(0, 0).text_frame.paragraphs[0].runs[0].font.size == Pt(32)
+
+
+def test_ppt_layout_usage_distinguishes_unused_template_parts(rich_deck):
+    deck = Presentation(rich_deck)
+    used_layout = str(deck.slides[0].slide_layout.part.partname).lstrip('/')
+    unused_layout = str(deck.slide_layouts[0].part.partname).lstrip('/')
+    master = str(deck.slide_masters[0].part.partname).lstrip('/')
+    usage = inherited_part_pages(rich_deck)
+    assert usage[used_layout] == [1]
+    assert usage[unused_layout] == []
+    assert usage[master] == [1]
+
+
+def test_unverifiable_ppt_layout_usage_is_not_assumed_unused(tmp_path):
+    source = tmp_path / 'broken.pptx'
+    source.write_bytes(b'not a zip')
+    with pytest.raises(ValueError, match='could not be verified'):
+        inherited_part_pages(source)
 
 
 @pytest.mark.parametrize('damage', ['media', 'font', 'bullet', 'geometry', 'background'])
